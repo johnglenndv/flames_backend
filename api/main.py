@@ -283,7 +283,7 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
 #---DELETION----
 # DELETE user
 @app.delete("/users/{user_id}")
-async def delete_user(user_id: int, current_user: dict = Depends(is_admin)):
+async def delete_user(user_id: int, current_user: dict = Depends(admin_required)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
@@ -298,7 +298,7 @@ async def delete_user(user_id: int, current_user: dict = Depends(is_admin)):
 
 # DELETE gateway
 @app.delete("/gateways/{gateway_id}")
-async def delete_gateway(gateway_id: str, current_user: dict = Depends(is_admin)):
+async def delete_gateway(gateway_id: str, current_user: dict = Depends(admin_required)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("DELETE FROM gateways WHERE gateway_id = %s", (gateway_id,))
@@ -313,7 +313,7 @@ async def delete_gateway(gateway_id: str, current_user: dict = Depends(is_admin)
 
 # DELETE invite code (by code or ID)
 @app.delete("/invite-codes/{code}")
-async def delete_invite_code(code: str, current_user: dict = Depends(is_admin)):
+async def delete_invite_code(code: str, current_user: dict = Depends(admin_required)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("DELETE FROM invite_codes WHERE code = %s", (code,))
@@ -328,7 +328,7 @@ async def delete_invite_code(code: str, current_user: dict = Depends(is_admin)):
 
 # DELETE organization (dangerous — cascades or blocks if users exist)
 @app.delete("/organizations/{org_id}")
-async def delete_organization(org_id: int, current_user: dict = Depends(is_admin)):
+async def delete_organization(org_id: int, current_user: dict = Depends(admin_required)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor()
     
