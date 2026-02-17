@@ -14,10 +14,16 @@ class UserCreate(BaseModel):
     username: str
     email: EmailStr | None = None
     password: str
+    invite_code: str
 
 class Token(BaseModel):
     access_token: str
     token_type: str
+    
+class Organization(BaseModel):
+    id: int
+    name: str
+    invite_code: str | None = None
 
 app = FastAPI(title="FLAMES API")
 
@@ -150,60 +156,6 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
 
     return rows
 
-@app.get("/me")
-async def get_current_user_info(current_user: dict = Depends(get_current_user)):
-    return {
-        "username": current_user["username"],
-        "email": current_user.get("email"),
-        "user_id": current_user["id"]
-    }
-
-@app.post("/signup")
-async def signup(user: UserCreate):
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cur = conn.cursor(dictionary=True)
-
-    # Check if username or email exists
-    cur.execute("SELECT id FROM users WHERE username = %s OR (email = %s AND email IS NOT NULL)", (user.username, user.email))
-    if cur.fetchone():
-        cur.close()
-        conn.close()
-        raise HTTPException(status_code=400, detail="Username or email already registered")
-
-    hashed_password = get_password_hash(user.password)
-
-    cur.execute("""
-        INSERT INTO users (username, email, password_hash)
-        VALUES (%s, %s, %s)
-    """, (user.username, user.email, hashed_password))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return {"message": "User created successfully"}
-
-@app.post("/login", response_model=Token)
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT * FROM users WHERE username = %s", (form_data.username,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    if not user or not verify_password(form_data.password, user["password_hash"]):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    access_token = create_access_token(data={"sub": user["username"]})
-
-    return {"access_token": access_token, "token_type": "bearer"}
-
-    
 @app.get("/nodes")
 async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -242,6 +194,84 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
         ph_nodes.append(row_copy)
 
     return ph_nodes if ph_nodes else []
+
+@app.get("/me")
+async def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    return {
+        "username": current_user["username"],
+        "email": current_user.get("email"),
+        "user_id": current_user["id"]
+    }
+
+@app.post("/signup")
+async def signup(user: UserCreate):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Validate invite code
+    cur.execute("""
+        SELECT id, name FROM organizations 
+        WHERE invite_code = %s 
+        AND (invite_code_expires IS NULL OR invite_code_expires > NOW())
+    """, (user.invite_code,))
+    org = cur.fetchone()
+
+    if not org:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Invalid or expired invite code")
+
+    # Check uniqueness
+    cur.execute("SELECT id FROM users WHERE username = %s OR (email = %s AND email IS NOT NULL)", (user.username, user.email))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username or email already taken")
+
+    hashed = get_password_hash(user.password)
+
+    cur.execute("""
+        INSERT INTO users (username, email, password_hash, org_id)
+        VALUES (%s, %s, %s, %s)
+    """, (user.username, user.email, hashed, org['id']))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "Account created", "organization": org['name']}
+
+@app.post("/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM users WHERE username = %s", (form_data.username,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not user or not verify_password(form_data.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(data={"sub": user["username"]})
+
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/organizations", response_model=list[Organization])
+async def get_organizations():
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT id, name, invite_code FROM organizations ORDER BY name")
+    orgs = cur.fetchall()
+    cur.close()
+    conn.close()
+    return orgs
+   
+
 
 if __name__ == "__main__":
     import uvicorn
