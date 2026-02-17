@@ -32,6 +32,12 @@ class GatewayCreate(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
     
+class OrganizationCreate(BaseModel):
+    name: str
+    description: str | None = None
+    invite_code: str | None = None          # optional: admin can set it
+    invite_code_expires_days: int | None = 30  # how many days valid
+    
 class InviteCodeCreate(BaseModel):
     code: str | None = None               # optional: auto-generate if empty
     expires_days: int = 30
@@ -361,6 +367,42 @@ async def register_gateway(gateway: GatewayCreate, current_user: dict = Depends(
         "message": "Gateway registered successfully",
         "gateway_id": gateway.gateway_id,
         "organization_id": current_user['org_id']
+    }
+    
+@app.post("/organizations")
+async def create_organization(org: OrganizationCreate, current_user: dict = Depends(get_current_user)):
+    # Optional: restrict to admins only (add is_admin column later)
+    # For now: any logged-in user can create orgs (demo-friendly)
+
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Check if org name already exists
+    cur.execute("SELECT id FROM organizations WHERE name = %s", (org.name,))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Organization name already exists")
+
+    expires = None
+    if org.invite_code_expires_days:
+        expires = datetime.now() + timedelta(days=org.invite_code_expires_days)
+
+    cur.execute("""
+        INSERT INTO organizations (name, description, invite_code, invite_code_expires, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (org.name, org.description, org.invite_code, expires, current_user['id']))
+
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.close()
+    conn.close()
+
+    return {
+        "message": "Organization created",
+        "id": new_id,
+        "name": org.name,
+        "invite_code": org.invite_code
     }
 
 @app.get("/organizations", response_model=list[Organization])
