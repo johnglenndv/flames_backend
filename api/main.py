@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
-
+#-----DATA MODELS START HERE----------------
 class UserCreate(BaseModel):
     username: str
     email: EmailStr | None = None
@@ -24,6 +24,22 @@ class Organization(BaseModel):
     id: int
     name: str
     invite_code: str | None = None
+    
+class GatewayCreate(BaseModel):
+    gateway_id: str
+    location_name: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    
+class InviteCodeCreate(BaseModel):
+    code: str | None = None               # optional: auto-generate if empty
+    expires_days: int = 30
+    max_uses: int = 1                     # 1 = single-use, 0 = unlimited
+    
+#-----DATA MODELS END HERE----------------
+
+
+
 
 app = FastAPI(title="FLAMES API")
 
@@ -53,6 +69,7 @@ DB_CONFIG = {
 
 PH_ZONE = ZoneInfo("Asia/Manila")
 
+#-----UTILITY FUNCTIONS START HERE----------------
 def convert_to_ph_time(db_timestamp):
     """Convert MySQL timestamp (datetime object) to PH local string"""
     if not db_timestamp:
@@ -105,7 +122,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     if user is None:
         raise credentials_exception
     return user
+#-----UTILITY FUNCTIONS END HERE----------------
 
+#-----API ENDPOINTS START HERE----------------
 @app.get("/latest/{node_id}")
 async def get_latest(node_id: str, current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -195,6 +214,46 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
 
     return ph_nodes if ph_nodes else []
 
+@app.post("/organizations/{org_id}/invite-codes")
+async def create_invite_code(
+    org_id: int,
+    invite: InviteCodeCreate,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Check user belongs to this org
+    if current_user['org_id'] != org_id:
+        raise HTTPException(403, "You can only create codes for your own organization")
+
+    # Check org exists
+    cur.execute("SELECT id FROM organizations WHERE id = %s", (org_id,))
+    if not cur.fetchone():
+        raise HTTPException(404, "Organization not found")
+
+    # Auto-generate code if none provided (simple random string)
+    code = invite.code or secrets.token_hex(8).upper()  # e.g. "A1B2C3D4"
+
+    expires = datetime.now() + timedelta(days=invite.expires_days)
+
+    cur.execute("""
+        INSERT INTO invite_codes (org_id, code, expires_at, max_uses, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (org_id, code, expires, invite.max_uses, current_user['id']))
+
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.close()
+    conn.close()
+
+    return {
+        "message": "Invite code created",
+        "code": code,
+        "expires_at": expires.isoformat(),
+        "max_uses": invite.max_uses
+    }
+
 @app.get("/me")
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     return {
@@ -203,6 +262,9 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "user_id": current_user["id"]
     }
 
+#-----API ENDPOINTS ENdPOINTS END HERE----------------
+    
+#----------LOGIN SIGNUP STARTS HERE---------------
 @app.post("/signup")
 async def signup(user: UserCreate):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -261,6 +323,44 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
 
     return {"access_token": access_token, "token_type": "bearer"}
 
+@app.post("/gateways")
+async def register_gateway(gateway: GatewayCreate, current_user: dict = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Check if gateway_id already exists
+    cur.execute("SELECT id FROM gateways WHERE gateway_id = %s", (gateway.gateway_id,))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Gateway ID already registered")
+
+    # Optional: check if current user is in an organization that can register gateways
+    # For now: any logged-in user can register (demo-friendly)
+
+    cur.execute("""
+        INSERT INTO gateways (gateway_id, org_id, location_name, latitude, longitude, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (
+        gateway.gateway_id,
+        current_user['org_id'],           # ← assigns to the user's own organization
+        gateway.location_name,
+        gateway.latitude,
+        gateway.longitude,
+        current_user['id']
+    ))
+
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.close()
+    conn.close()
+
+    return {
+        "message": "Gateway registered successfully",
+        "gateway_id": gateway.gateway_id,
+        "organization_id": current_user['org_id']
+    }
+
 @app.get("/organizations", response_model=list[Organization])
 async def get_organizations():
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -270,7 +370,7 @@ async def get_organizations():
     cur.close()
     conn.close()
     return orgs
-   
+#--------------------LOGIN SIGNUP ENDS HERE-------------------
 
 
 if __name__ == "__main__":
