@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -9,6 +9,26 @@ from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import secrets, string
+from typing import List
+
+#-------WEBSOCKET MANAGER START HERE----------------
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
+            await connection.send_json(message)
+
+manager = ConnectionManager()
+#-------WEBSOCKET MANAGER END HERE----------------
 
 #-----DATA MODELS START HERE----------------
 class UserCreate(BaseModel):
@@ -137,6 +157,17 @@ async def admin_required(current_user: dict = Depends(get_current_user)):
         )
     return current_user
 #-----UTILITY FUNCTIONS END HERE----------------
+
+#----WEBSOCKET ENDPOINTS START HERE----------------
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()  # keep alive (can be ignored)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+#----WEBSOCKET ENDPOINTS END HERE----------------
 
 #-----API ENDPOINTS START HERE----------------
 @app.get("/latest/{node_id}")
@@ -494,6 +525,11 @@ async def get_organizations():
     conn.close()
     return orgs
 #--------------------LOGIN SIGNUP ENDS HERE-------------------
+
+@app.post("/notify-new-data")
+async def notify_new_data(data: dict):
+    await manager.broadcast(data)
+    return {"status": "broadcasted"}
 
 
 if __name__ == "__main__":

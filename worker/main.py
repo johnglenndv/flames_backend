@@ -4,6 +4,7 @@ from datetime import datetime
 import paho.mqtt.client as mqtt
 import mysql.connector
 from mysql.connector import Error
+import json, requests
 
 # HiveMQ config (from env vars)
 BROKER = os.getenv("HIVEMQ_HOST")
@@ -75,8 +76,33 @@ def on_message(client, userdata, msg):
             snr
         ))
         conn.commit()
-        cur.close()
-        conn.close()
+        new_reading = {
+            "node_id": node,
+            "timestamp": ph_timestamp,
+            "temperature": temp,
+            "humidity": hum,
+            "flame": flame,
+            "smoke": smoke,
+            "latitude": lat,
+            "longitude": lon,
+            "rssi": rssi,
+            "snr": snr,
+         # add any other fields you want frontend to receive instantly
+        }
+
+        try:
+            # Tell API to broadcast to all WebSocket clients
+            requests.post(
+                "https://api-production-32ac.up.railway.app/notify-new-data",
+                json=new_reading,
+                timeout=2
+            )
+            print("Notified WebSocket clients")
+        except Exception as e:
+            print(f"Notify failed: {e}")
+        finally:
+            cur.close()
+            conn.close()
 
         print(f"Inserted node {node} with PH timestamp: {ph_timestamp}")
 
