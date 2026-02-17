@@ -93,3 +93,31 @@ async def get_history(node_id: str, limit: int = 50):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    
+@app.get("/nodes")
+async def get_all_nodes():
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    
+    # Get distinct nodes + their most recent reading
+    cur.execute("""
+        SELECT DISTINCT s.node_id,
+               (SELECT temperature FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
+               (SELECT humidity   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
+               (SELECT flame      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS flame,
+               (SELECT smoke      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS smoke,
+               (SELECT latitude   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS latitude,
+               (SELECT longitude  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
+               (SELECT rssi       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
+               (SELECT snr        FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
+               (SELECT timestamp  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp,
+               (SELECT display_timestamp FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS display_timestamp
+        FROM sensor_readings s
+        ORDER BY s.node_id
+    """)
+    
+    nodes = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    return nodes if nodes else []
