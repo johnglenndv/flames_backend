@@ -29,7 +29,8 @@ async def get_latest(node_id: str):
     cur.execute("""
         SELECT * FROM sensor_readings 
         WHERE node_id = %s 
-        ORDER BY timestamp DESC LIMIT 1
+        ORDER BY timestamp DESC, id DESC
+        LIMIT 1
     """, (node_id,))
     row = cur.fetchone()
     cur.close()
