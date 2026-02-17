@@ -100,6 +100,8 @@ async def get_all_nodes():
     cur = conn.cursor(dictionary=True)
     
     # Get distinct nodes + their most recent reading
+    # Use id DESC instead of timestamp (your working sort)
+    # No reference to non-existent display_timestamp
     cur.execute("""
         SELECT DISTINCT s.node_id,
                (SELECT temperature FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
@@ -110,8 +112,7 @@ async def get_all_nodes():
                (SELECT longitude  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
                (SELECT rssi       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
                (SELECT snr        FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
-               (SELECT timestamp  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp,
-               (SELECT display_timestamp FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS display_timestamp
+               (SELECT timestamp  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp
         FROM sensor_readings s
         ORDER BY s.node_id
     """)
@@ -120,4 +121,14 @@ async def get_all_nodes():
     cur.close()
     conn.close()
 
-    return nodes if nodes else []
+    # Convert timestamps to PH time in Python (same as /latest)
+    ph_nodes = []
+    for row in nodes:
+        row_copy = row.copy()
+        if row_copy.get("timestamp"):
+            row_copy["display_timestamp"] = convert_to_ph_time(row_copy["timestamp"])
+        else:
+            row_copy["display_timestamp"] = "N/A"
+        ph_nodes.append(row_copy)
+
+    return ph_nodes if ph_nodes else []
