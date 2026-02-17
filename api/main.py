@@ -128,6 +128,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     if user is None:
         raise credentials_exception
     return user
+
+async def admin_required(current_user: dict = Depends(get_current_user)):
+    if current_user.get('is_admin') != 1:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin access required"
+        )
+    return current_user
 #-----UTILITY FUNCTIONS END HERE----------------
 
 #-----API ENDPOINTS START HERE----------------
@@ -224,7 +232,8 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
 async def create_invite_code(
     org_id: int,
     invite: InviteCodeCreate,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user), 
+    _admin: dict = Depends(admin_required)
 ):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
@@ -270,6 +279,77 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     }
 
 #-----API ENDPOINTS ENdPOINTS END HERE----------------
+
+#---DELETION----
+# DELETE user
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: int, current_user: dict = Depends(is_admin)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+    if cur.rowcount == 0:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="User not found")
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "User deleted successfully"}
+
+# DELETE gateway
+@app.delete("/gateways/{gateway_id}")
+async def delete_gateway(gateway_id: str, current_user: dict = Depends(is_admin)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM gateways WHERE gateway_id = %s", (gateway_id,))
+    if cur.rowcount == 0:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Gateway not found")
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Gateway deleted successfully"}
+
+# DELETE invite code (by code or ID)
+@app.delete("/invite-codes/{code}")
+async def delete_invite_code(code: str, current_user: dict = Depends(is_admin)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM invite_codes WHERE code = %s", (code,))
+    if cur.rowcount == 0:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Invite code not found")
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Invite code deleted"}
+
+# DELETE organization (dangerous — cascades or blocks if users exist)
+@app.delete("/organizations/{org_id}")
+async def delete_organization(org_id: int, current_user: dict = Depends(is_admin)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    
+    # Optional safety: check if org has users
+    cur.execute("SELECT COUNT(*) FROM users WHERE org_id = %s", (org_id,))
+    if cur.fetchone()[0] > 0:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Cannot delete organization with active users")
+
+    cur.execute("DELETE FROM organizations WHERE id = %s", (org_id,))
+    if cur.rowcount == 0:
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=404, detail="Organization not found")
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": "Organization deleted"}
+#--------------------DELETION END HERE-------------------
     
 #----------LOGIN SIGNUP STARTS HERE---------------
 @app.post("/signup")
@@ -331,7 +411,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/gateways")
-async def register_gateway(gateway: GatewayCreate, current_user: dict = Depends(get_current_user)):
+async def register_gateway(gateway: GatewayCreate, current_user: dict = Depends(get_current_user), _admin: dict = Depends(admin_required)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
 
@@ -369,7 +449,7 @@ async def register_gateway(gateway: GatewayCreate, current_user: dict = Depends(
     }
     
 @app.post("/organizations")
-async def create_organization(org: OrganizationCreate, current_user: dict = Depends(get_current_user)):
+async def create_organization(org: OrganizationCreate, current_user: dict = Depends(get_current_user), _admin: dict = Depends(admin_required)):
     # Optional: restrict to admins only (add is_admin column later)
     # For now: any logged-in user can create orgs (demo-friendly)
 
