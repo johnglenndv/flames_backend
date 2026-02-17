@@ -150,6 +150,14 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
 
     return rows
 
+@app.get("/me")
+async def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    return {
+        "username": current_user["username"],
+        "email": current_user.get("email"),
+        "user_id": current_user["id"]
+    }
+
 @app.post("/signup")
 async def signup(user: UserCreate):
     conn = mysql.connector.connect(**DB_CONFIG)
