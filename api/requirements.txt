@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 mysql-connector-python
 python-jose[cryptography]
 passlib[bcrypt]==1.7.4
