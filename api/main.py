@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+import secrets
 
 #-----DATA MODELS START HERE----------------
 class UserCreate(BaseModel):
