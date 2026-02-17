@@ -9,13 +9,12 @@ app = FastAPI(title="FLAMES API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Change to your actual frontend domain later for security
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Railway auto-injected DB vars
 DB_CONFIG = {
     "host": os.getenv("MYSQLHOST"),
     "port": int(os.getenv("MYSQLPORT", 3306)),
@@ -24,19 +23,22 @@ DB_CONFIG = {
     "database": os.getenv("MYSQLDATABASE"),
 }
 
-# PH timezone
 PH_ZONE = ZoneInfo("Asia/Manila")
 
-def convert_to_ph_time(utc_str):
-    """Convert UTC timestamp string from DB to PH local time string"""
+def convert_to_ph_time(db_timestamp):
+    """Convert MySQL timestamp (datetime object) to PH local string"""
+    if not db_timestamp:
+        return "N/A"
+    
     try:
-        # MySQL returns UTC string without offset → force UTC parse
-        utc_dt = datetime.fromisoformat(utc_str + '+00:00')
-        ph_dt = utc_dt.astimezone(PH_ZONE)
+        # db_timestamp is already a datetime object (from mysql-connector)
+        # Assume it's UTC → convert to PH
+        ph_dt = db_timestamp.astimezone(PH_ZONE)
         return ph_dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception as e:
         print(f"Timezone conversion error: {e}")
-        return utc_str  # fallback to original if parsing fails
+        # Fallback: return original as string
+        return str(db_timestamp)
 
 @app.get("/latest/{node_id}")
 async def get_latest(node_id: str):
@@ -59,11 +61,8 @@ async def get_latest(node_id: str):
     if not row:
         return {"status": "no_data"}
 
-    # Convert timestamp to PH local time
-    if row.get("timestamp"):
-        row["display_timestamp"] = convert_to_ph_time(row["timestamp"])
-    else:
-        row["display_timestamp"] = "N/A"
+    # Convert timestamp to PH time
+    row["display_timestamp"] = convert_to_ph_time(row.get("timestamp"))
 
     return row
 
@@ -85,12 +84,9 @@ async def get_history(node_id: str, limit: int = 50):
     cur.close()
     conn.close()
 
-    # Convert timestamps for all rows
+    # Convert each row
     for row in rows:
-        if row.get("timestamp"):
-            row["display_timestamp"] = convert_to_ph_time(row["timestamp"])
-        else:
-            row["display_timestamp"] = "N/A"
+        row["display_timestamp"] = convert_to_ph_time(row.get("timestamp"))
 
     return rows
 
