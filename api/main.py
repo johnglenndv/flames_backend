@@ -34,7 +34,6 @@ class GatewayCreate(BaseModel):
     
 class OrganizationCreate(BaseModel):
     name: str
-    description: str | None = None
     invite_code: str | None = None          # optional: admin can set it
     invite_code_expires_days: int | None = 30  # how many days valid
     
@@ -389,9 +388,9 @@ async def create_organization(org: OrganizationCreate, current_user: dict = Depe
         expires = datetime.now() + timedelta(days=org.invite_code_expires_days)
 
     cur.execute("""
-        INSERT INTO organizations (name, description, invite_code, invite_code_expires, created_by)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (org.name, org.description, org.invite_code, expires, current_user['id']))
+        INSERT INTO organizations (name, invite_code, invite_code_expires, created_by)
+        VALUES (%s, %s, %s, %s)
+    """, (org.name, org.invite_code, expires, current_user['id']))
 
     conn.commit()
     new_id = cur.lastrowid
