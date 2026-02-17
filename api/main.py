@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-import secrets
+import secrets, string
 
 #-----DATA MODELS START HERE----------------
 class UserCreate(BaseModel):
@@ -234,7 +234,8 @@ async def create_invite_code(
         raise HTTPException(404, "Organization not found")
 
     # Auto-generate code if none provided (simple random string)
-    code = invite.code or secrets.token_hex(8).upper()  # e.g. "A1B2C3D4"
+    alphabet = string.ascii_uppercase + string.digits  # A-Z + 0-9
+    code = ''.join(secrets.choice(alphabet) for _ in range(8))  # e.g. "K7N4P8X2"
 
     expires = datetime.now() + timedelta(days=invite.expires_days)
 
