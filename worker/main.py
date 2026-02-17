@@ -1,30 +1,32 @@
-# worker/main.py
 import os
 import json
+from datetime import datetime
 import paho.mqtt.client as mqtt
 import mysql.connector
 from mysql.connector import Error
-from datetime import datetime
 
-# ── Config ──────────────────────────────────────────────
-BROKER = os.getenv("HIVEMQ_HOST", "528e719c19214a19b07c0e7322298267.s1.eu.hivemq.cloud")
+# HiveMQ config (from env vars)
+BROKER = os.getenv("HIVEMQ_HOST")
 PORT   = 8883
-USER   = os.getenv("HIVEMQ_USER", "Uplink01")
-PASS   = os.getenv("HIVEMQ_PASS", "Uplink01")
+USER   = os.getenv("HIVEMQ_USER")
+PASS   = os.getenv("HIVEMQ_PASS")
 TOPIC  = "lora/uplink"
 
+# MySQL (Railway auto-injected)
 DB_CONFIG = {
-    "host":     os.getenv("MYSQLHOST"),
-    "port":     int(os.getenv("MYSQLPORT", 3306)),
-    "user":     os.getenv("MYSQLUSER"),
+    "host": os.getenv("MYSQLHOST"),
+    "port": int(os.getenv("MYSQLPORT", 3306)),
+    "user": os.getenv("MYSQLUSER"),
     "password": os.getenv("MYSQLPASSWORD"),
     "database": os.getenv("MYSQLDATABASE"),
 }
 
 def on_connect(client, userdata, flags, rc):
-    print(f"Connected to MQTT (rc={rc})")
-    client.subscribe(TOPIC)
-    print(f"Subscribed to {TOPIC}")
+    if rc == 0:
+        print("MQTT connected")
+        client.subscribe(TOPIC)
+    else:
+        print(f"MQTT connect failed rc={rc}")
 
 def on_message(client, userdata, msg):
     try:
@@ -35,40 +37,51 @@ def on_message(client, userdata, msg):
         wrapper = data
         payload = wrapper.get("payload", {})
         node    = payload.get("node")
-
         if not node:
-            print("No node field → skipping")
+            print("No node → skip")
             return
 
-        # Map your payload fields (adjust keys if needed)
-        row = (
-            node,
-            wrapper.get("received_at"),
-            payload.get("temp"),
-            payload.get("hum"),
-            payload.get("flame", 0),
-            payload.get("smoke", 0),
-            payload.get("lat"),
-            payload.get("lon"),
-            wrapper.get("rssi"),
-            wrapper.get("snr")
-        )
+        # Use the gateway's received_at directly (already in PH time with +08:00)
+        ph_timestamp = wrapper.get("received_at")  # e.g. "2026-02-17T11:20:26+08:00"
+
+        # Extract other fields
+        temp  = payload.get("temp")
+        hum   = payload.get("hum")
+        flame = payload.get("flame", 0)
+        smoke = payload.get("smoke", 0)
+        lat   = payload.get("lat")
+        lon   = payload.get("lon")
+        rssi  = wrapper.get("rssi")
+        snr   = wrapper.get("snr")
 
         conn = mysql.connector.connect(**DB_CONFIG)
         cur = conn.cursor()
-        cur.execute("""
+        sql = """
             INSERT INTO sensor_readings
-            (node_id, timestamp, temperature, humidity, flame, smoke, latitude, longitude, rssi, snr)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, row)
+            (node_id, timestamp, local_timestamp, temperature, humidity, flame, smoke, latitude, longitude, rssi, snr)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cur.execute(sql, (
+            node,
+            ph_timestamp,          # original (for reference)
+            ph_timestamp,          # store same value in local_timestamp (already PH)
+            temp,
+            hum,
+            flame,
+            smoke,
+            lat,
+            lon,
+            rssi,
+            snr
+        ))
         conn.commit()
         cur.close()
         conn.close()
 
-        print(f"Inserted data for {node}")
+        print(f"Inserted node {node} with PH timestamp: {ph_timestamp}")
 
     except Exception as e:
-        print("Error processing message:", e)
+        print("Error:", e)
 
 client = mqtt.Client()
 client.username_pw_set(USER, PASS)
