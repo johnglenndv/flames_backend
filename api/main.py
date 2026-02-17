@@ -1,9 +1,23 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
 import mysql.connector
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+
+
+class UserCreate(BaseModel):
+    username: str
+    email: EmailStr | None = None
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 app = FastAPI(title="FLAMES API")
 
@@ -14,6 +28,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# JWT settings - CHANGE THIS SECRET KEY IN RAILWAY VARIABLES!
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-super-secret-key-change-this-immediately")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1 day
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 DB_CONFIG = {
     "host": os.getenv("MYSQLHOST"),
@@ -39,9 +61,47 @@ def convert_to_ph_time(db_timestamp):
         print(f"Timezone conversion error: {e}")
         # Fallback: return original as string
         return str(db_timestamp)
+    
+    
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: timedelta | None = None):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    if user is None:
+        raise credentials_exception
+    return user
 
 @app.get("/latest/{node_id}")
-async def get_latest(node_id: str):
+async def get_latest(node_id: str, current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
     
@@ -67,7 +127,7 @@ async def get_latest(node_id: str):
     return row
 
 @app.get("/history/{node_id}")
-async def get_history(node_id: str, limit: int = 50):
+async def get_history(node_id: str, limit: int = 50, current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
     
@@ -90,12 +150,54 @@ async def get_history(node_id: str, limit: int = 50):
 
     return rows
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+@app.post("/signup")
+async def signup(user: UserCreate):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Check if username or email exists
+    cur.execute("SELECT id FROM users WHERE username = %s OR (email = %s AND email IS NOT NULL)", (user.username, user.email))
+    if cur.fetchone():
+        cur.close()
+        conn.close()
+        raise HTTPException(status_code=400, detail="Username or email already registered")
+
+    hashed_password = get_password_hash(user.password)
+
+    cur.execute("""
+        INSERT INTO users (username, email, password_hash)
+        VALUES (%s, %s, %s)
+    """, (user.username, user.email, hashed_password))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {"message": "User created successfully"}
+
+@app.post("/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("SELECT * FROM users WHERE username = %s", (form_data.username,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not user or not verify_password(form_data.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    access_token = create_access_token(data={"sub": user["username"]})
+
+    return {"access_token": access_token, "token_type": "bearer"}
+
     
 @app.get("/nodes")
-async def get_all_nodes():
+async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
     
@@ -132,3 +234,7 @@ async def get_all_nodes():
         ph_nodes.append(row_copy)
 
     return ph_nodes if ph_nodes else []
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
