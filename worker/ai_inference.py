@@ -1,30 +1,32 @@
 import os
 import json
 import joblib
-import numpy as np
 import pandas as pd
+import numpy as np
 import paho.mqtt.client as mqtt
 import mysql.connector
-import requests  # For API notification
+import requests
 from datetime import datetime
 from mysql.connector import Error
 
 # --- 1. LOAD AI ASSETS ---
+# Ensure fire_model.pkl, scaler.pkl, and classes.pkl are in the same folder
 try:
     model = joblib.load('fire_model.pkl')
     scaler = joblib.load('scaler.pkl')
     class_names = joblib.load('classes.pkl')
-    print("AI Model loaded successfully.")
+    print("AI Model and Scaler loaded successfully.")
 except Exception as e:
-    print(f"AI Loading Warning: {e}. Check if .pkl files exist.")
+    print(f"AI Loading Error: {e}")
 
-# --- CONFIGURATION (Preserved) ---
+# HiveMQ config (from env vars)
 BROKER = os.getenv("HIVEMQ_HOST")
 PORT   = 8883
 USER   = os.getenv("HIVEMQ_USER")
 PASS   = os.getenv("HIVEMQ_PASS")
 TOPIC  = "lora/uplink"
 
+# MySQL (Railway auto-injected)
 DB_CONFIG = {
     "host": os.getenv("MYSQLHOST"),
     "port": int(os.getenv("MYSQLPORT", 3306)),
@@ -50,10 +52,10 @@ def on_message(client, userdata, msg):
         payload = wrapper.get("payload", {})
         node    = payload.get("node")
         if not node:
-            print("No node → skip")
+            print("No node -> skip")
             return
 
-        # 2. Extract Data (All original fields preserved)
+        # Extract fields
         ph_timestamp = wrapper.get("received_at")
         temp  = payload.get("temp")
         hum   = payload.get("hum")
@@ -64,17 +66,19 @@ def on_message(client, userdata, msg):
         rssi  = wrapper.get("rssi")
         snr   = wrapper.get("snr")
 
-        # 3. AI INFERENCE
-        # Creating a DataFrame ensures the scaler gets the correct feature names
-        input_data = pd.DataFrame([[smoke, temp, flame, hum]], 
-                                 columns=['smoke', 'temperature', 'flame', 'humidity'])
+        # --- AI INFERENCE ---
+        # Features must be in the exact order: temp, hum, flame, smoke
+        input_df = pd.DataFrame([[smoke,temp,flame,hum]], 
+                                columns=['smoke', 'temperature', 'flame', 'humidity'])
         
-        scaled_input = scaler.transform(input_data)
-        probs = model.predict_proba(scaled_input)[0]
-        prediction = class_names[np.argmax(probs)]
-        confidence = float(np.max(probs))
+        scaled_input = scaler.transform(input_df)
+        probabilities = model.predict_proba(scaled_input)[0]
+        prediction_index = np.argmax(probabilities)
+        
+        final_label = class_names[prediction_index]
+        confidence = float(probabilities[prediction_index])
 
-        # 4. DATABASE INSERT
+        # --- DATABASE INSERT ---
         conn = mysql.connector.connect(**DB_CONFIG)
         cur = conn.cursor()
         sql = """
@@ -87,11 +91,11 @@ def on_message(client, userdata, msg):
             node, ph_timestamp, ph_timestamp,
             temp, hum, flame, smoke,
             lat, lon, rssi, snr,
-            prediction, confidence
+            final_label, confidence
         ))
         conn.commit()
 
-        # 5. API NOTIFICATION (Enriched with AI results)
+        # --- WEBHOOK NOTIFICATION ---
         new_reading = {
             "node_id": node,
             "timestamp": ph_timestamp,
@@ -103,8 +107,8 @@ def on_message(client, userdata, msg):
             "longitude": lon,
             "rssi": rssi,
             "snr": snr,
-            "ai_prediction": prediction,  # NEW: Frontend can now show "FIRE"
-            "confidence": f"{confidence*100:.2f}%" # NEW: Frontend shows %
+            "ai_prediction": final_label,
+            "confidence": f"{confidence * 100:.2f}%"
         }
 
         try:
@@ -113,23 +117,24 @@ def on_message(client, userdata, msg):
                 json=new_reading,
                 timeout=2
             )
-            print(f"Notified WebSocket: {prediction} ({confidence*100:.1f}%)")
+            print("Notified WebSocket clients")
         except Exception as e:
             print(f"Notify failed: {e}")
         finally:
             cur.close()
             conn.close()
 
-    except Exception as e:
-        print("Error in on_message:", e)
+        print(f"Inserted node {node}. Result: {final_label} ({confidence*100:.1f}%)")
 
-# --- START CLIENT ---
+    except Exception as e:
+        print("Error:", e)
+
 client = mqtt.Client()
 client.username_pw_set(USER, PASS)
 client.tls_set()
 client.on_connect = on_connect
 client.on_message = on_message
 
-print("Starting AI Gateway with WebSocket Notification...")
+print("Starting AI-Enhanced MQTT to MySQL worker...")
 client.connect(BROKER, PORT, 60)
 client.loop_forever()
