@@ -66,8 +66,8 @@ def on_message(client, userdata, msg):
 
         # 3. AI INFERENCE
         # Creating a DataFrame ensures the scaler gets the correct feature names
-        input_data = pd.DataFrame([[temp, hum, flame, smoke]], 
-                                 columns=['temp', 'hum', 'flame', 'smoke'])
+        input_data = pd.DataFrame([[smoke, temp, flame, hum]], 
+                                 columns=['smoke', 'temperature', 'flame', 'humidity'])
         
         scaled_input = scaler.transform(input_data)
         probs = model.predict_proba(scaled_input)[0]
