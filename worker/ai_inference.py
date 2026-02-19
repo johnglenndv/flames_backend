@@ -113,17 +113,46 @@ def on_message(client, userdata, msg):
 
         try:
             requests.post(
-                "https://api-production-32ac.up.railway.app/notify-new-data",
+                "https://flamesapp.up.railway.app/notify-new-data",
                 json=new_reading,
                 timeout=2
             )
             print("Notified WebSocket clients")
         except Exception as e:
             print(f"Notify failed: {e}")
+            
+                    # --- NEW: Broadcast only for incident-relevant updates ---
+            should_broadcast_incident = False
+
+            if final_label == "fire" and confidence >= 0.50:           # adjust threshold as needed
+                should_broadcast_incident = True
+            elif final_label in ("normal", "FALSE") and confidence >= 0.70:
+                # High-confidence normal → might resolve an incident
+                should_broadcast_incident = True
+
+            if should_broadcast_incident:
+                incident_update = {
+                    "type": "incident_update",
+                    "node_id": node,
+                    "ai_prediction": final_label,
+                    "confidence": confidence,
+                    "timestamp": ph_timestamp,
+                    "latitude": lat,
+                    "longitude": lon
+                }
+
+            try:
+                requests.post(
+                    "https://flamesapp.up.railway.app/notify-new-data",
+                    json=incident_update,
+                    timeout=2
+                )
+                print(f"Broadcasted incident_update for node {node} ({final_label}, conf {confidence:.2f})")
+            except Exception as e:
+                print(f"Incident WS notify failed: {e}")
         finally:
             cur.close()
             conn.close()
-
         print(f"Inserted node {node}. Result: {final_label} ({confidence*100:.1f}%)")
 
     except Exception as e:
