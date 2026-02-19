@@ -381,6 +381,85 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
     conn.close()
     return {"message": "Organization deleted"}
 #--------------------DELETION END HERE-------------------
+
+#-------Machine Learning Inference Endpoint (called by worker)----------------
+@app.get("/incidents/active")
+async def get_active_incidents(current_user: dict = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    
+    # Get the MOST RECENT reading for each node
+    # Then filter / classify based on ai_prediction + confidence
+    cur.execute("""
+        SELECT 
+            sr.node_id,
+            sr.timestamp,
+            sr.temperature,
+            sr.humidity,
+            sr.flame,
+            sr.smoke,
+            sr.latitude,
+            sr.longitude,
+            sr.ai_prediction,
+            sr.confidence,
+            -- Optional: derive friendly location name later
+            CONCAT('Node ', sr.node_id) AS location_name
+        FROM sensor_readings sr
+        INNER JOIN (
+            SELECT node_id, MAX(id) AS max_id
+            FROM sensor_readings
+            GROUP BY node_id
+        ) latest ON sr.node_id = latest.node_id AND sr.id = latest.max_id
+        WHERE sr.ai_prediction = 'fire' 
+           OR (sr.ai_prediction = 'FALSE' AND sr.confidence < 0.3)  -- example filter
+        ORDER BY sr.timestamp DESC
+        LIMIT 20   -- prevent sending too many at once
+    """)
+    
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    incidents = []
+    for row in rows:
+        confidence_pct = float(row['confidence']) if row['confidence'] is not None else 0.0
+        pred = row['ai_prediction']
+
+        # You can tune these rules – this is just an example
+        if pred == 'fire':
+            if confidence_pct >= 0.70:
+                status = "Active"
+                status_class = "txt-active"
+            elif confidence_pct >= 0.40:
+                status = "Possible"
+                status_class = "txt-contained"
+            else:
+                status = "Low Confidence"
+                status_class = "txt-resolved"
+        else:
+            status = "Normal"
+            status_class = "txt-resolved"
+
+        incidents.append({
+            "node_id": row["node_id"],
+            "location_name": row["location_name"],
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+            "ai_prediction": pred,
+            "confidence": confidence_pct,
+            "confidence_pct": round(confidence_pct * 100, 1),
+            "status": status,
+            "status_class": status_class,
+            "temperature": row["temperature"],
+            "smoke": row["smoke"],
+            "flame": row["flame"],
+            "timestamp": convert_to_ph_time(row["timestamp"]),
+            "assigned_team": None   # ← add logic later if you have teams table
+        })
+
+    return incidents
+
+#---------This endpoint is called by the worker after AI inference to store results and notify frontend via WebSocket.---------
     
 #----------LOGIN SIGNUP STARTS HERE---------------
 @app.post("/signup")
