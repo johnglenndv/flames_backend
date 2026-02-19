@@ -203,7 +203,7 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
     
     cur.execute("""
         SELECT id, node_id, timestamp, temperature, humidity, flame, smoke,
-               latitude, longitude, rssi, snr
+               latitude, longitude, rssi, snr, ai_prediction, confidence
         FROM sensor_readings 
         WHERE node_id = %s 
         ORDER BY id DESC 
@@ -259,41 +259,23 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
 
     return ph_nodes if ph_nodes else []
 
-@app.post("/organizations/{org_id}/invite-codes")
-async def create_invite_code(
-    org_id: int,
-    invite: InviteCodeCreate,
-    current_user: dict = Depends(get_current_user), 
-    _admin: dict = Depends(admin_required)  # ← ensures only admins can call this
-):
+@app.post("/organizations")
+async def create_organization(org: OrganizationCreate, current_user: dict = Depends(get_current_user), _admin: dict = Depends(admin_required)):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
 
-    # Check if the target organization exists
-    cur.execute("SELECT id, name FROM organizations WHERE id = %s", (org_id,))
-    org = cur.fetchone()
-    if not org:
+    # Check if org name already exists
+    cur.execute("SELECT id FROM organizations WHERE name = %s", (org.name,))
+    if cur.fetchone():
         cur.close()
         conn.close()
-        raise HTTPException(404, "Organization not found")
+        raise HTTPException(status_code=400, detail="Organization name already exists")
 
-    # No org_id ownership check anymore — admins can create for ANY org
-
-    # Auto-generate code if none provided
-    code = invite.code
-    if not code:
-        alphabet = string.ascii_uppercase + string.digits
-        code = ''.join(secrets.choice(alphabet) for _ in range(8))
-
-    expires = None
-    if invite.expires_days:
-        expires = datetime.now() + timedelta(days=invite.expires_days)
-
+    # No expiry handling anymore — invite_code will be NULL or permanent
     cur.execute("""
-        INSERT INTO invite_codes 
-        (org_id, code, expires_at, max_uses, created_by)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (org_id, code, expires, invite.max_uses, current_user['id']))
+        INSERT INTO organizations (name, invite_code, invite_code_expires, created_by)
+        VALUES (%s, %s, %s, %s)
+    """, (org.name, org.invite_code, None, current_user['id']))  # invite_code_expires = NULL
 
     conn.commit()
     new_id = cur.lastrowid
@@ -301,12 +283,10 @@ async def create_invite_code(
     conn.close()
 
     return {
-        "message": "Invite code created",
-        "code": code,
-        "organization_id": org_id,
-        "organization_name": org['name'],
-        "expires_at": expires.isoformat() if expires else None,
-        "max_uses": invite.max_uses
+        "message": "Organization created",
+        "id": new_id,
+        "name": org.name,
+        "invite_code": org.invite_code  # may be null if not provided
     }
     
 class InviteCodeAdminCreate(BaseModel):
