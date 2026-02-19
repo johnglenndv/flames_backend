@@ -264,28 +264,34 @@ async def create_invite_code(
     org_id: int,
     invite: InviteCodeCreate,
     current_user: dict = Depends(get_current_user), 
-    _admin: dict = Depends(admin_required)
+    _admin: dict = Depends(admin_required)  # ← ensures only admins can call this
 ):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
 
-    # Check user belongs to this org
-    if current_user['org_id'] != org_id:
-        raise HTTPException(403, "You can only create codes for your own organization")
-
-    # Check org exists
-    cur.execute("SELECT id FROM organizations WHERE id = %s", (org_id,))
-    if not cur.fetchone():
+    # Check if the target organization exists
+    cur.execute("SELECT id, name FROM organizations WHERE id = %s", (org_id,))
+    org = cur.fetchone()
+    if not org:
+        cur.close()
+        conn.close()
         raise HTTPException(404, "Organization not found")
 
-    # Auto-generate code if none provided (simple random string)
-    alphabet = string.ascii_uppercase + string.digits  # A-Z + 0-9
-    code = ''.join(secrets.choice(alphabet) for _ in range(8))  # e.g. "K7N4P8X2"
+    # No org_id ownership check anymore — admins can create for ANY org
 
-    expires = datetime.now() + timedelta(days=invite.expires_days)
+    # Auto-generate code if none provided
+    code = invite.code
+    if not code:
+        alphabet = string.ascii_uppercase + string.digits
+        code = ''.join(secrets.choice(alphabet) for _ in range(8))
+
+    expires = None
+    if invite.expires_days:
+        expires = datetime.now() + timedelta(days=invite.expires_days)
 
     cur.execute("""
-        INSERT INTO invite_codes (org_id, code, expires_at, max_uses, created_by)
+        INSERT INTO invite_codes 
+        (org_id, code, expires_at, max_uses, created_by)
         VALUES (%s, %s, %s, %s, %s)
     """, (org_id, code, expires, invite.max_uses, current_user['id']))
 
@@ -297,7 +303,59 @@ async def create_invite_code(
     return {
         "message": "Invite code created",
         "code": code,
-        "expires_at": expires.isoformat(),
+        "organization_id": org_id,
+        "organization_name": org['name'],
+        "expires_at": expires.isoformat() if expires else None,
+        "max_uses": invite.max_uses
+    }
+    
+class InviteCodeAdminCreate(BaseModel):
+    org_id: int
+    code: str | None = None
+    expires_days: int = 30
+    max_uses: int = 1
+
+@app.post("/admin/invite-codes")
+async def admin_create_invite_code(
+    invite: InviteCodeAdminCreate,
+    current_user: dict = Depends(get_current_user), 
+    _admin: dict = Depends(admin_required)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Verify org exists
+    cur.execute("SELECT id, name FROM organizations WHERE id = %s", (invite.org_id,))
+    org = cur.fetchone()
+    if not org:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Organization not found")
+
+    code = invite.code
+    if not code:
+        alphabet = string.ascii_uppercase + string.digits
+        code = ''.join(secrets.choice(alphabet) for _ in range(8))
+
+    expires = datetime.now() + timedelta(days=invite.expires_days) if invite.expires_days else None
+
+    cur.execute("""
+        INSERT INTO invite_codes 
+        (org_id, code, expires_at, max_uses, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (invite.org_id, code, expires, invite.max_uses, current_user['id']))
+
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.close()
+    conn.close()
+
+    return {
+        "message": "Admin created invite code",
+        "code": code,
+        "organization_id": invite.org_id,
+        "organization_name": org['name'],
+        "expires_at": expires.isoformat() if expires else None,
         "max_uses": invite.max_uses
     }
 
