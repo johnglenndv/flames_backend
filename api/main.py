@@ -532,7 +532,7 @@ async def signup(user: UserCreate):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
 
-    # Validate invite code
+    # 1. Try to find organization by invite code in organizations table (old method)
     cur.execute("""
         SELECT id, name FROM organizations 
         WHERE invite_code = %s 
@@ -540,13 +540,51 @@ async def signup(user: UserCreate):
     """, (user.invite_code,))
     org = cur.fetchone()
 
-    if not org:
-        cur.close()
-        conn.close()
+    org_id = None
+
+    if org:
+        # Found in organizations table — classic method
+        org_id = org['id']
+        print(f"Signup using organization invite code: {user.invite_code}")
+    else:
+        # 2. Not found → check invite_codes table (new method)
+        cur.execute("""
+            SELECT org_id, code, expires_at, max_uses, uses 
+            FROM invite_codes 
+            WHERE code = %s 
+            AND (expires_at IS NULL OR expires_at > NOW())
+        """, (user.invite_code,))
+        invite = cur.fetchone()
+
+        if invite:
+            # Code found — check usage limit
+            if invite['max_uses'] > 0 and invite['uses'] >= invite['max_uses']:
+                cur.close()
+                conn.close()
+                raise HTTPException(status_code=400, detail="Invite code has reached maximum uses")
+
+            org_id = invite['org_id']
+            print(f"Signup using invite_codes code: {user.invite_code} (org_id {org_id})")
+
+            # Increment uses count
+            cur.execute("""
+                UPDATE invite_codes 
+                SET uses = uses + 1 
+                WHERE code = %s
+            """, (user.invite_code,))
+            conn.commit()
+        else:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Invalid or expired invite code")
+
+    # Proceed only if we found a valid org_id
+    if not org_id:
         raise HTTPException(status_code=400, detail="Invalid or expired invite code")
 
-    # Check uniqueness
-    cur.execute("SELECT id FROM users WHERE username = %s OR (email = %s AND email IS NOT NULL)", (user.username, user.email))
+    # Check uniqueness of username/email
+    cur.execute("SELECT id FROM users WHERE username = %s OR (email = %s AND email IS NOT NULL)", 
+                (user.username, user.email))
     if cur.fetchone():
         cur.close()
         conn.close()
@@ -557,13 +595,13 @@ async def signup(user: UserCreate):
     cur.execute("""
         INSERT INTO users (username, email, password_hash, org_id)
         VALUES (%s, %s, %s, %s)
-    """, (user.username, user.email, hashed, org['id']))
+    """, (user.username, user.email, hashed, org_id))
 
     conn.commit()
     cur.close()
     conn.close()
 
-    return {"message": "Account created", "organization": org['name']}
+    return {"message": "Account created", "organization_id": org_id}
 
 @app.post("/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
