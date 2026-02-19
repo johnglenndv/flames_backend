@@ -10,7 +10,6 @@ from datetime import datetime
 from mysql.connector import Error
 
 # --- 1. LOAD AI ASSETS ---
-# Ensure fire_model.pkl, scaler.pkl, and classes.pkl are in the same folde
 try:
     model = joblib.load('fire_model.pkl')
     scaler = joblib.load('scaler.pkl')
@@ -67,8 +66,7 @@ def on_message(client, userdata, msg):
         snr   = wrapper.get("snr")
 
         # --- AI INFERENCE ---
-        # Features must be in the exact order: temp, hum, flame, smoke
-        input_df = pd.DataFrame([[smoke,temp,flame,hum]], 
+        input_df = pd.DataFrame([[smoke, temp, flame, hum]], 
                                 columns=['smoke', 'temperature', 'flame', 'humidity'])
         
         scaled_input = scaler.transform(input_df)
@@ -95,7 +93,41 @@ def on_message(client, userdata, msg):
         ))
         conn.commit()
 
-        # --- WEBHOOK NOTIFICATION ---
+        # ── NEW: Decide whether to broadcast incident_update ────────────────────────────────
+        should_broadcast_incident = False
+        final_label_lower = str(final_label).lower().strip()
+
+        if final_label_lower == "fire" and confidence >= 0.50:
+            should_broadcast_incident = True
+            print(f"DEBUG: Fire detected → will broadcast incident_update (conf {confidence:.2f})")
+        elif final_label_lower in ("normal", "false", "no fire", "safe", "none") and confidence >= 0.70:
+            should_broadcast_incident = True
+            print(f"DEBUG: High-conf normal/safe → will broadcast possible resolution (conf {confidence:.2f})")
+        else:
+            print(f"DEBUG: No incident broadcast needed (label='{final_label_lower}', conf={confidence:.2f})")
+
+        if should_broadcast_incident:
+            incident_update = {
+                "type": "incident_update",
+                "node_id": node,
+                "ai_prediction": final_label,
+                "confidence": confidence,
+                "timestamp": ph_timestamp,
+                "latitude": lat,
+                "longitude": lon
+            }
+
+            try:
+                requests.post(
+                    "https://flamesapp.up.railway.app/notify-new-data",
+                    json=incident_update,
+                    timeout=2
+                )
+                print(f"Broadcasted incident_update for node {node} ({final_label}, conf {confidence:.2f})")
+            except Exception as e:
+                print(f"Incident WS notify failed: {e}")
+
+        # --- WEBHOOK NOTIFICATION (original basic reading broadcast) ---
         new_reading = {
             "node_id": node,
             "timestamp": ph_timestamp,
@@ -117,42 +149,14 @@ def on_message(client, userdata, msg):
                 json=new_reading,
                 timeout=2
             )
-            print("Notified WebSocket clients")
+            print("Notified WebSocket clients (basic reading)")
         except Exception as e:
             print(f"Notify failed: {e}")
-            
-                    # --- NEW: Broadcast only for incident-relevant updates ---
-            should_broadcast_incident = False
 
-            if final_label == "fire" and confidence >= 0.50:           # adjust threshold as needed
-                should_broadcast_incident = True
-            elif final_label in ("normal", "FALSE") and confidence >= 0.70:
-                # High-confidence normal → might resolve an incident
-                should_broadcast_incident = True
-
-            if should_broadcast_incident:
-                incident_update = {
-                    "type": "incident_update",
-                    "node_id": node,
-                    "ai_prediction": final_label,
-                    "confidence": confidence,
-                    "timestamp": ph_timestamp,
-                    "latitude": lat,
-                    "longitude": lon
-                }
-
-            try:
-                requests.post(
-                    "https://flamesapp.up.railway.app/notify-new-data",
-                    json=incident_update,
-                    timeout=2
-                )
-                print(f"Broadcasted incident_update for node {node} ({final_label}, conf {confidence:.2f})")
-            except Exception as e:
-                print(f"Incident WS notify failed: {e}")
         finally:
             cur.close()
             conn.close()
+
         print(f"Inserted node {node}. Result: {final_label} ({confidence*100:.1f}%)")
 
     except Exception as e:
