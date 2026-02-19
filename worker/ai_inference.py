@@ -10,7 +10,7 @@ from datetime import datetime
 from mysql.connector import Error
 
 # --- 1. LOAD AI ASSETS ---
-# Ensure fire_model.pkl, scaler.pkl, and classes.pkl are in the same folder
+# Ensure fire_model.pkl, scaler.pkl, and classes.pkl are in the same folde
 try:
     model = joblib.load('fire_model.pkl')
     scaler = joblib.load('scaler.pkl')
