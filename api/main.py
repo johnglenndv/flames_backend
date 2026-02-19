@@ -460,6 +460,71 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     return incidents
 
 #---------This endpoint is called by the worker after AI inference to store results and notify frontend via WebSocket.---------
+
+# ── Pinned Locations ───────────────────────────────────────────────
+
+class PinCreate(BaseModel):
+    name: str | None = None
+    latitude: float
+    longitude: float
+
+@app.get("/me/pins")
+async def get_my_pins(current_user: dict = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    
+    cur.execute("""
+        SELECT id, name, latitude, longitude, created_at
+        FROM user_pinned_locations
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+    """, (current_user['id'],))
+    
+    pins = cur.fetchall()
+    cur.close()
+    conn.close()
+    
+    return pins
+
+@app.post("/me/pins")
+async def add_pin(pin: PinCreate, current_user: dict = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    
+    cur.execute("""
+        INSERT INTO user_pinned_locations (user_id, name, latitude, longitude)
+        VALUES (%s, %s, %s, %s)
+    """, (current_user['id'], pin.name, pin.latitude, pin.longitude))
+    
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.close()
+    conn.close()
+    
+    return {"message": "Pin saved", "id": new_id}
+
+# Optional: delete pin
+@app.delete("/me/pins/{pin_id}")
+async def delete_pin(pin_id: int, current_user: dict = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    
+    cur.execute("""
+        DELETE FROM user_pinned_locations 
+        WHERE id = %s AND user_id = %s
+    """, (pin_id, current_user['id']))
+    
+    if cur.rowcount == 0:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Pin not found or not owned by you")
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    
+    return {"message": "Pin deleted"}
+#---------END OF PIN ENDPOINTS----------------
     
 #----------LOGIN SIGNUP STARTS HERE---------------
 @app.post("/signup")
