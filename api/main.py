@@ -338,6 +338,43 @@ async def admin_create_invite_code(
         "expires_at": expires.isoformat() if expires else None,
         "max_uses": invite.max_uses
     }
+    
+@app.post("/organizations/{org_id}/invite-codes")
+async def create_invite_code_for_org(
+    org_id: int,
+    invite: InviteCodeCreate,
+    current_user: dict = Depends(get_current_user),
+    _admin: dict = Depends(admin_required)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Verify org exists
+    cur.execute("SELECT id, name FROM organizations WHERE id = %s", (org_id,))
+    org = cur.fetchone()
+    if not org:
+        cur.close()
+        conn.close()
+        raise HTTPException(404, "Organization not found")
+
+    code = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+    expires = datetime.now() + timedelta(days=invite.expires_days) if invite.expires_days else None
+
+    cur.execute("""
+        INSERT INTO invite_codes (org_id, code, expires_at, max_uses, created_by)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (org_id, code, expires, invite.max_uses, current_user['id']))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return {
+        "code": code,
+        "organization_id": org_id,
+        "expires_at": expires.isoformat() if expires else None,
+        "max_uses": invite.max_uses
+    }
 
 @app.get("/me")
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
