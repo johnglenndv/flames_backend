@@ -378,10 +378,34 @@ async def create_invite_code_for_org(
 
 @app.get("/me")
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    
+    cur.execute("""
+        SELECT 
+            u.id, u.username, u.email, u.created_at,
+            u.is_admin,
+            o.id AS org_id, o.name AS organization_name
+        FROM users u
+        LEFT JOIN organizations o ON u.org_id = o.id
+        WHERE u.id = %s
+    """, (current_user["id"],))
+    
+    full_user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not full_user:
+        raise HTTPException(404, "User not found")
+
     return {
-        "username": current_user["username"],
-        "email": current_user.get("email"),
-        "user_id": current_user["id"]
+        "user_id": full_user["id"],
+        "username": full_user["username"],
+        "email": full_user.get("email"),
+        "created_at": full_user["created_at"].isoformat() if full_user["created_at"] else None,
+        "is_admin": bool(full_user["is_admin"]),
+        "organization_id": full_user["org_id"],
+        "organization_name": full_user["organization_name"] or "—"
     }
 
 #-----API ENDPOINTS ENdPOINTS END HERE----------------
