@@ -40,6 +40,69 @@ def on_connect(client, userdata, flags, rc):
         client.subscribe(TOPIC)
     else:
         print(f"MQTT connect failed rc={rc}")
+        
+def ensure_gateway_exists(conn, gateway_id: str):
+    """Create minimal gateway record if it doesn't exist — lat/lon stay NULL"""
+    cur = conn.cursor()
+    try:
+        # Check if already exists
+        cur.execute(
+            "SELECT 1 FROM gateways WHERE gateway_id = %s LIMIT 1",
+            (gateway_id,)
+        )
+        if cur.fetchone():
+            return  # already exists → nothing to do
+
+        # Create with minimal info — coordinates left as NULL
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        cur.execute("""
+            INSERT INTO gateways 
+            (gateway_id, location_name, status, created_at)
+            VALUES (%s, %s, %s, %s)
+        """, (
+            gateway_id,
+            f"Gateway {gateway_id} — location pending",
+            "active",           # or "online", "provisioned", whatever fits your app
+            now
+        ))
+        
+        conn.commit()
+        print(f"→ Auto-created new gateway: {gateway_id}  (lat/lon = NULL)")
+        print(  "   → Please update coordinates manually in the gateways table")
+        
+    except mysql.connector.Error as err:
+        print(f"Failed to auto-create gateway {gateway_id}: {err}")
+        conn.rollback()
+    finally:
+        cur.close()
+
+def ensure_gateway_exists(conn, gateway_id: str):
+    """Create gateway record if it doesn't exist yet"""
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT 1 FROM gateways WHERE gateway_id = %s LIMIT 1", (gateway_id,))
+        if cur.fetchone():
+            return  # already exists
+
+        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        cur.execute("""
+            INSERT INTO gateways 
+            (gateway_id, location_name, status, created_at)
+            VALUES (%s, %s, %s, %s)
+        """, (
+            gateway_id,
+            f"Auto-registered {gateway_id}",
+            "active",
+            now
+        ))
+        conn.commit()
+        print(f"→ Auto-created gateway: {gateway_id}")
+    except mysql.connector.Error as err:
+        print(f"Error creating gateway {gateway_id}: {err}")
+        conn.rollback()
+    finally:
+        cur.close()
+
 
 def on_message(client, userdata, msg):
     try:
@@ -48,13 +111,18 @@ def on_message(client, userdata, msg):
         print("Received:", data)
 
         wrapper = data
-        payload = wrapper.get("payload", {})
-        node    = payload.get("node")
+        gateway_id = wrapper.get("gateway")
+        payload    = wrapper.get("payload", {})
+        node       = payload.get("node")
+
+        if not gateway_id:
+            print("Missing gateway id → skipping message")
+            return
         if not node:
-            print("No node -> skip")
+            print("Missing node id → skipping message")
             return
 
-        # Extract fields
+        # Extract sensor fields
         ph_timestamp = wrapper.get("received_at")
         temp  = payload.get("temp")
         hum   = payload.get("hum")
@@ -76,91 +144,105 @@ def on_message(client, userdata, msg):
         final_label = class_names[prediction_index]
         confidence = float(probabilities[prediction_index])
 
-        # --- DATABASE INSERT ---
+        # --- DATABASE OPERATIONS ---
         conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        sql = """
-            INSERT INTO sensor_readings
-            (node_id, timestamp, local_timestamp, temperature, humidity, flame, smoke, 
-             latitude, longitude, rssi, snr, ai_prediction, confidence)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """
-        cur.execute(sql, (
-            node, ph_timestamp, ph_timestamp,
-            temp, hum, flame, smoke,
-            lat, lon, rssi, snr,
-            final_label, confidence
-        ))
-        conn.commit()
+        try:
+            # 1. Ensure gateway exists
+            ensure_gateway_exists(conn, gateway_id)
 
-        # ── NEW: Decide whether to broadcast incident_update ────────────────────────────────
-        should_broadcast_incident = False
-        final_label_lower = str(final_label).lower().strip()
+            # 2. Insert sensor reading (now includes gateway_id)
+            cur = conn.cursor()
+            sql = """
+                INSERT INTO sensor_readings
+                (gateway_id, node_id, timestamp, local_timestamp, temperature, humidity, flame, smoke, 
+                 latitude, longitude, rssi, snr, ai_prediction, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cur.execute(sql, (
+                gateway_id,
+                node,
+                ph_timestamp,
+                ph_timestamp,
+                temp, hum, flame, smoke,
+                lat, lon, rssi, snr,
+                final_label,
+                confidence
+            ))
+            conn.commit()
 
-        if final_label_lower == "fire" and confidence >= 0.50:
-            should_broadcast_incident = True
-            print(f"DEBUG: Fire detected → will broadcast incident_update (conf {confidence:.2f})")
-        elif final_label_lower in ("normal", "false", "no fire", "safe", "none") and confidence >= 0.70:
-            should_broadcast_incident = True
-            print(f"DEBUG: High-conf normal/safe → will broadcast possible resolution (conf {confidence:.2f})")
-        else:
-            print(f"DEBUG: No incident broadcast needed (label='{final_label_lower}', conf={confidence:.2f})")
+            # ── Decide whether to broadcast incident_update ──
+            should_broadcast_incident = False
+            final_label_lower = str(final_label).lower().strip()
 
-        if should_broadcast_incident:
-            incident_update = {
-                "type": "incident_update",
+            if final_label_lower == "fire" and confidence >= 0.50:
+                should_broadcast_incident = True
+                print(f"DEBUG: Fire detected → broadcast incident_update (conf {confidence:.2f})")
+            elif final_label_lower in ("normal", "false", "no fire", "safe", "none") and confidence >= 0.70:
+                should_broadcast_incident = True
+                print(f"DEBUG: High-conf normal/safe → broadcast resolution (conf {confidence:.2f})")
+            else:
+                print(f"DEBUG: No broadcast needed (label='{final_label_lower}', conf={confidence:.2f})")
+
+            if should_broadcast_incident:
+                incident_update = {
+                    "type": "incident_update",
+                    "node_id": node,
+                    "ai_prediction": final_label,
+                    "confidence": confidence,
+                    "timestamp": ph_timestamp,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "gateway_id": gateway_id   # ← optional: added for better context
+                }
+                try:
+                    requests.post(
+                        "https://flamesapp.up.railway.app/notify-new-data",
+                        json=incident_update,
+                        timeout=2
+                    )
+                    print(f"Broadcasted incident_update for {node} ({final_label}, conf {confidence:.2f})")
+                except Exception as e:
+                    print(f"Incident notify failed: {e}")
+
+            # --- Basic reading notification ---
+            new_reading = {
                 "node_id": node,
-                "ai_prediction": final_label,
-                "confidence": confidence,
+                "gateway_id": gateway_id,          # ← added
                 "timestamp": ph_timestamp,
+                "temperature": temp,
+                "humidity": hum,
+                "flame": flame,
+                "smoke": smoke,
                 "latitude": lat,
-                "longitude": lon
+                "longitude": lon,
+                "rssi": rssi,
+                "snr": snr,
+                "ai_prediction": final_label,
+                "confidence": f"{confidence * 100:.2f}%"
             }
 
             try:
                 requests.post(
                     "https://flamesapp.up.railway.app/notify-new-data",
-                    json=incident_update,
+                    json=new_reading,
                     timeout=2
                 )
-                print(f"Broadcasted incident_update for node {node} ({final_label}, conf {confidence:.2f})")
+                print("Notified WebSocket clients (basic reading)")
             except Exception as e:
-                print(f"Incident WS notify failed: {e}")
+                print(f"Notify failed: {e}")
 
-        # --- WEBHOOK NOTIFICATION (original basic reading broadcast) ---
-        new_reading = {
-            "node_id": node,
-            "timestamp": ph_timestamp,
-            "temperature": temp,
-            "humidity": hum,
-            "flame": flame,
-            "smoke": smoke,
-            "latitude": lat,
-            "longitude": lon,
-            "rssi": rssi,
-            "snr": snr,
-            "ai_prediction": final_label,
-            "confidence": f"{confidence * 100:.2f}%"
-        }
+            print(f"Inserted → gateway={gateway_id} node={node} → {final_label} ({confidence*100:.1f}%)")
 
-        try:
-            requests.post(
-                "https://flamesapp.up.railway.app/notify-new-data",
-                json=new_reading,
-                timeout=2
-            )
-            print("Notified WebSocket clients (basic reading)")
-        except Exception as e:
-            print(f"Notify failed: {e}")
-
+        except mysql.connector.Error as db_err:
+            print(f"Database error: {db_err}")
+            conn.rollback()
         finally:
-            cur.close()
+            if 'cur' in locals():
+                cur.close()
             conn.close()
 
-        print(f"Inserted node {node}. Result: {final_label} ({confidence*100:.1f}%)")
-
     except Exception as e:
-        print("Error:", e)
+        print("General error in on_message:", e)
 
 client = mqtt.Client()
 client.username_pw_set(USER, PASS)
