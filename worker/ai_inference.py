@@ -42,42 +42,6 @@ def on_connect(client, userdata, flags, rc):
         print(f"MQTT connect failed rc={rc}")
         
 def ensure_gateway_exists(conn, gateway_id: str):
-    """Create minimal gateway record if it doesn't exist — lat/lon stay NULL"""
-    cur = conn.cursor()
-    try:
-        # Check if already exists
-        cur.execute(
-            "SELECT 1 FROM gateways WHERE gateway_id = %s LIMIT 1",
-            (gateway_id,)
-        )
-        if cur.fetchone():
-            return  # already exists → nothing to do
-
-        # Create with minimal info — coordinates left as NULL
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        cur.execute("""
-            INSERT INTO gateways 
-            (gateway_id, location_name, status, created_at)
-            VALUES (%s, %s, %s, %s)
-        """, (
-            gateway_id,
-            f"Gateway {gateway_id} — location pending",
-            "active",           # or "online", "provisioned", whatever fits your app
-            now
-        ))
-        
-        conn.commit()
-        print(f"→ Auto-created new gateway: {gateway_id}  (lat/lon = NULL)")
-        print(  "   → Please update coordinates manually in the gateways table")
-        
-    except mysql.connector.Error as err:
-        print(f"Failed to auto-create gateway {gateway_id}: {err}")
-        conn.rollback()
-    finally:
-        cur.close()
-
-def ensure_gateway_exists(conn, gateway_id: str):
-    """Create gateway record if it doesn't exist yet"""
     cur = conn.cursor()
     try:
         cur.execute("SELECT 1 FROM gateways WHERE gateway_id = %s LIMIT 1", (gateway_id,))
@@ -88,21 +52,21 @@ def ensure_gateway_exists(conn, gateway_id: str):
         cur.execute("""
             INSERT INTO gateways 
             (gateway_id, location_name, status, created_at)
+            -- org_id is intentionally omitted → becomes NULL
             VALUES (%s, %s, %s, %s)
         """, (
             gateway_id,
-            f"Auto-registered {gateway_id}",
-            "active",
+            f"Gateway {gateway_id} — location & org pending",
+            "maintenance",           # or 'offline' / 'active' — whatever you prefer as default
             now
         ))
         conn.commit()
-        print(f"→ Auto-created gateway: {gateway_id}")
+        print(f"→ Auto-created gateway: {gateway_id} (org_id = NULL)")
     except mysql.connector.Error as err:
         print(f"Error creating gateway {gateway_id}: {err}")
         conn.rollback()
     finally:
         cur.close()
-
 
 def on_message(client, userdata, msg):
     try:
