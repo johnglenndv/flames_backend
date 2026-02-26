@@ -211,10 +211,6 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
         row["display_timestamp"] = convert_to_ph_time(row.get("timestamp"))
     return rows
 
-# ── CHANGED: /nodes is now org-scoped
-#    - Admin  → all nodes (unchanged behaviour)
-#    - Member → only nodes whose gateway belongs to their org
-#    REQUIRES: gateway_id column in sensor_readings (see migration at bottom of file)
 @app.get("/nodes")
 async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -223,7 +219,6 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
 
-    # Correlated subquery columns are identical for both branches
     LATEST = """
         (SELECT temperature   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
         (SELECT humidity      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
@@ -237,7 +232,6 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     """
 
     if is_admin:
-        # Same query as before — no restriction
         cur.execute(f"""
             SELECT DISTINCT s.node_id, {LATEST}
             FROM sensor_readings s
@@ -247,7 +241,6 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
         if not user_org:
             cur.close(); conn.close()
             return []
-        # Only nodes whose readings came through a gateway owned by this org
         cur.execute(f"""
             SELECT DISTINCT s.node_id, {LATEST}
             FROM sensor_readings s
@@ -268,8 +261,6 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     return ph_nodes
 
 
-# ── CHANGED: /organizations GET is now auth-required and org-scoped
-#    Admin → all orgs  |  Member → only their own org (for dropdowns)
 @app.get("/organizations", response_model=list[Organization])
 async def get_organizations(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -287,9 +278,6 @@ async def get_organizations(current_user: dict = Depends(get_current_user)):
     return orgs
 
 
-# ── CHANGED: POST /organizations
-#    - Removed invite_code_expires_days (invite codes are now permanent, expires = NULL)
-#    - Added uniqueness check on invite_code
 @app.post("/organizations")
 async def create_organization(
     org: OrganizationCreate,
@@ -304,7 +292,6 @@ async def create_organization(
         cur.close(); conn.close()
         raise HTTPException(status_code=400, detail="Organization name already exists")
 
-    # Prevent two orgs sharing the same permanent code
     if org.invite_code:
         cur.execute("SELECT id FROM organizations WHERE invite_code = %s", (org.invite_code,))
         if cur.fetchone():
@@ -329,9 +316,6 @@ async def create_organization(
     }
 
 
-# ── NEW: GET /gateways
-#    Admin  → all gateways (+ org_name for context); optional ?org_id= filter for admin panel table cells
-#    Member → only gateways belonging to their org  (this is what the map calls)
 @app.get("/gateways")
 async def get_gateways(
     org_id: Optional[int] = None,
@@ -345,7 +329,6 @@ async def get_gateways(
 
     if is_admin:
         if org_id is not None:
-            # Used by admin panel to populate the gateway cells in the org table
             cur.execute("""
                 SELECT gateway_id, org_id, location_name, latitude, longitude, created_at
                 FROM gateways
@@ -353,7 +336,6 @@ async def get_gateways(
                 ORDER BY gateway_id
             """, (org_id,))
         else:
-            # Full list for map + gateway select in Create Org form
             cur.execute("""
                 SELECT g.gateway_id, g.org_id, g.location_name,
                        g.latitude, g.longitude, g.created_at,
@@ -379,8 +361,6 @@ async def get_gateways(
     return gateways
 
 
-# ── NEW: PATCH /gateways/{gateway_id}/assign-org
-#    Called by the frontend after creating an org and selecting gateways to assign.
 @app.patch("/gateways/{gateway_id}/assign-org")
 async def assign_gateway_to_org(
     gateway_id: str,
@@ -405,6 +385,34 @@ async def assign_gateway_to_org(
     cur.close()
     conn.close()
     return {"message": f"Gateway '{gateway_id}' assigned to org {body.org_id}"}
+
+
+# ── NEW: PATCH /gateways/{gateway_id}/disassociate-org
+#    Sets org_id = NULL — removes gateway from any organization
+@app.patch("/gateways/{gateway_id}/disassociate-org")
+async def disassociate_gateway_from_org(
+    gateway_id: str,
+    current_user: dict = Depends(get_current_user),
+    _admin: dict = Depends(admin_required)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("SELECT gateway_id, org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
+    gw = cur.fetchone()
+    if not gw:
+        cur.close(); conn.close()
+        raise HTTPException(404, f"Gateway '{gateway_id}' not found")
+
+    if gw['org_id'] is None:
+        cur.close(); conn.close()
+        raise HTTPException(400, f"Gateway '{gateway_id}' is not assigned to any organization")
+
+    cur.execute("UPDATE gateways SET org_id = NULL WHERE gateway_id = %s", (gateway_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"message": f"Gateway '{gateway_id}' disassociated from its organization"}
 
 
 @app.get("/me")
@@ -488,7 +496,6 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
     return {"message": "Organization deleted"}
 #--------------------DELETION END HERE-------------------
 
-# ── CHANGED: /incidents/active is now org-scoped (same logic as /nodes)
 @app.get("/incidents/active")
 async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -497,7 +504,6 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
 
-    # The inner subquery that finds MAX(id) per node needs the same org filter
     if is_admin:
         cur.execute("""
             SELECT
@@ -590,7 +596,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
         })
     return incidents
 
-# ── Pinned Locations (unchanged) ──────────────────────────────────
+# ── Pinned Locations ──────────────────────────────────
 @app.get("/me/pins")
 async def get_my_pins(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -633,7 +639,7 @@ async def delete_pin(pin_id: int, current_user: dict = Depends(get_current_user)
     cur.close(); conn.close()
     return {"message": "Pin deleted"}
 
-# ── Login / Signup (unchanged) ────────────────────────────────────
+# ── Login / Signup ────────────────────────────────────
 @app.post("/signup")
 async def signup(user: UserCreate):
     conn = mysql.connector.connect(**DB_CONFIG)
