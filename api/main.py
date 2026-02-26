@@ -62,6 +62,13 @@ class InviteCodeCreate(BaseModel):
     expires_days: int = 30
     max_uses: int = 1                     # 1 = single-use, 0 = unlimited
     
+class AssignOrgBody(BaseModel):
+    org_id: int
+
+class OrganizationCreateV2(BaseModel):
+    name: str
+    invite_code: str | None = None   # permanent code, no expiry
+    
 #-----DATA MODELS END HERE----------------
 
 
@@ -222,72 +229,102 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
 
 @app.get("/nodes")
 async def get_all_nodes(current_user: dict = Depends(get_current_user)):
+    """
+    Returns nodes from sensor_readings, scoped by org:
+      - Admins: all nodes (from all orgs)
+      - Members: only nodes whose gateway belongs to their org
+    """
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
-    
-    # Get distinct nodes + their most recent reading
-    # Use id DESC instead of timestamp (your working sort)
-    # No reference to non-existent display_timestamp
-    cur.execute("""
-        SELECT DISTINCT s.node_id,
-               (SELECT temperature FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
-               (SELECT humidity   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
-               (SELECT flame      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS flame,
-               (SELECT smoke      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS smoke,
-               (SELECT latitude   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS latitude,
-               (SELECT longitude  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
-               (SELECT rssi       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
-               (SELECT snr        FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
-               (SELECT timestamp  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp
-        FROM sensor_readings s
-        ORDER BY s.node_id
-    """)
-    
+
+    is_admin = current_user.get('is_admin') == 1
+    user_org_id = current_user.get('org_id')
+
+    if is_admin:
+        # All nodes, unfiltered
+        cur.execute("""
+            SELECT DISTINCT s.node_id,
+                   (SELECT temperature FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
+                   (SELECT humidity   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
+                   (SELECT flame      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS flame,
+                   (SELECT smoke      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS smoke,
+                   (SELECT latitude   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS latitude,
+                   (SELECT longitude  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
+                   (SELECT rssi       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
+                   (SELECT snr        FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
+                   (SELECT ai_prediction FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS ai_prediction,
+                   (SELECT confidence    FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS confidence,
+                   (SELECT timestamp  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp
+            FROM sensor_readings s
+            ORDER BY s.node_id
+        """)
+    else:
+        # Member: only nodes whose most-recent reading has a gateway_id that belongs to their org.
+        # If sensor_readings has a gateway_id column, filter on it:
+        if not user_org_id:
+            cur.close(); conn.close()
+            return []
+        cur.execute("""
+            SELECT DISTINCT s.node_id,
+                   (SELECT temperature FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
+                   (SELECT humidity   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
+                   (SELECT flame      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS flame,
+                   (SELECT smoke      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS smoke,
+                   (SELECT latitude   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS latitude,
+                   (SELECT longitude  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
+                   (SELECT rssi       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
+                   (SELECT snr        FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
+                   (SELECT ai_prediction FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS ai_prediction,
+                   (SELECT confidence    FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS confidence,
+                   (SELECT timestamp  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp
+            FROM sensor_readings s
+            INNER JOIN gateways g ON g.gateway_id = s.gateway_id
+            WHERE g.org_id = %s
+            ORDER BY s.node_id
+        """, (user_org_id,))
+
     nodes = cur.fetchall()
     cur.close()
     conn.close()
 
-    # Convert timestamps to PH time in Python (same as /latest)
     ph_nodes = []
     for row in nodes:
         row_copy = row.copy()
-        if row_copy.get("timestamp"):
-            row_copy["display_timestamp"] = convert_to_ph_time(row_copy["timestamp"])
-        else:
-            row_copy["display_timestamp"] = "N/A"
+        row_copy["display_timestamp"] = convert_to_ph_time(row_copy.get("timestamp")) if row_copy.get("timestamp") else "N/A"
         ph_nodes.append(row_copy)
 
-    return ph_nodes if ph_nodes else []
+    return ph_nodes
 
 @app.post("/organizations")
-async def create_organization(org: OrganizationCreate, current_user: dict = Depends(get_current_user), _admin: dict = Depends(admin_required)):
+async def create_organization(
+    org: OrganizationCreateV2,
+    current_user: dict = Depends(get_current_user),
+    _admin: dict = Depends(admin_required)
+):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
 
-    # Check if org name already exists
     cur.execute("SELECT id FROM organizations WHERE name = %s", (org.name,))
     if cur.fetchone():
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
         raise HTTPException(status_code=400, detail="Organization name already exists")
 
-    # No expiry handling anymore — invite_code will be NULL or permanent
+    if org.invite_code:
+        cur.execute("SELECT id FROM organizations WHERE invite_code = %s", (org.invite_code,))
+        if cur.fetchone():
+            cur.close(); conn.close()
+            raise HTTPException(status_code=400, detail="Invite code already in use by another organization")
+
     cur.execute("""
         INSERT INTO organizations (name, invite_code, invite_code_expires, created_by)
-        VALUES (%s, %s, %s, %s)
-    """, (org.name, org.invite_code, None, current_user['id']))  # invite_code_expires = NULL
+        VALUES (%s, %s, NULL, %s)
+    """, (org.name, org.invite_code or None, current_user['id']))
 
     conn.commit()
     new_id = cur.lastrowid
-    cur.close()
-    conn.close()
+    cur.close(); conn.close()
 
-    return {
-        "message": "Organization created",
-        "id": new_id,
-        "name": org.name,
-        "invite_code": org.invite_code  # may be null if not provided
-    }
+    return {"message": "Organization created", "id": new_id, "name": org.name, "invite_code": org.invite_code}
     
 class InviteCodeAdminCreate(BaseModel):
     org_id: int
@@ -407,8 +444,81 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_id": full_user["org_id"],
         "organization_name": full_user["organization_name"] or "—"
     }
+    
+@app.get("/gateways")
+async def get_gateways(
+    org_id: int | None = None,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Returns gateways visible to the current user:
+      - Admins: all gateways (optionally filtered by ?org_id=X for admin panel)
+      - Members: only gateways belonging to their own organization
+    """
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    is_admin = current_user.get('is_admin') == 1
+    user_org_id = current_user.get('org_id')
+
+    if is_admin:
+        # Admin can see all, or filter by a specific org for the admin panel table
+        if org_id is not None:
+            cur.execute("""
+                SELECT gateway_id, org_id, location_name, latitude, longitude, created_at
+                FROM gateways WHERE org_id = %s ORDER BY gateway_id
+            """, (org_id,))
+        else:
+            cur.execute("""
+                SELECT g.gateway_id, g.org_id, g.location_name, g.latitude, g.longitude,
+                       g.created_at, o.name AS org_name
+                FROM gateways g
+                LEFT JOIN organizations o ON g.org_id = o.id
+                ORDER BY g.gateway_id
+            """)
+    else:
+        # Member: only their org's gateways
+        if not user_org_id:
+            cur.close(); conn.close()
+            return []
+        cur.execute("""
+            SELECT gateway_id, org_id, location_name, latitude, longitude, created_at
+            FROM gateways WHERE org_id = %s ORDER BY gateway_id
+        """, (user_org_id,))
+
+    gateways = cur.fetchall()
+    cur.close(); conn.close()
+    return gateways
 
 #-----API ENDPOINTS ENdPOINTS END HERE----------------
+
+#---PATCH START HERE----
+@app.patch("/gateways/{gateway_id}/assign-org")
+async def assign_gateway_to_org(
+    gateway_id: str,
+    body: AssignOrgBody,
+    current_user: dict = Depends(get_current_user),
+    _admin: dict = Depends(admin_required)
+):
+    """Reassign a gateway to a specific organization."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Verify org exists
+    cur.execute("SELECT id FROM organizations WHERE id = %s", (body.org_id,))
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        raise HTTPException(404, "Organization not found")
+
+    cur.execute("UPDATE gateways SET org_id = %s WHERE gateway_id = %s", (body.org_id, gateway_id))
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        raise HTTPException(404, f"Gateway '{gateway_id}' not found")
+
+    conn.commit()
+    cur.close(); conn.close()
+    return {"message": f"Gateway '{gateway_id}' assigned to org {body.org_id}"}
+#---PATCH END HERE----
 
 #---DELETION----
 # DELETE user
