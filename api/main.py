@@ -592,7 +592,11 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "temperature":    row["temperature"],
             "smoke":          row["smoke"],
             "flame":          row["flame"],
-            "timestamp":      convert_to_ph_time(row["timestamp"]),
+            "timestamp":      (
+                                row["local_timestamp"].strftime("%Y-%m-%d %H:%M:%S")
+                                if row.get("local_timestamp")
+                                else convert_to_ph_time(row["timestamp"])
+                              ),
             "assigned_team":  None,
         })
     return incidents
