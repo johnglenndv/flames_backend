@@ -806,3 +806,117 @@ if __name__ == "__main__":
         proxy_headers=True,
         forwarded_allow_ips="*"
     )
+    
+    
+#---simulation for fire----
+@app.post("/dev/simulate-fire")
+async def simulate_fire(
+    node_id: str = "Node1",
+    gateway_id: str = "GW1",
+    current_user: dict = Depends(get_current_user)  # any logged-in user
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    # Optional but good: verify the gateway actually belongs to the user's org
+    # so a member can't simulate fire on another org's gateway
+    is_admin = current_user.get('is_admin') == 1
+    user_org = current_user.get('org_id')
+
+    if not is_admin:
+        cur.execute(
+            "SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,)
+        )
+        gw = cur.fetchone()
+        if not gw:
+            cur.close(); conn.close()
+            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
+        if gw['org_id'] != user_org:
+            cur.close(); conn.close()
+            raise HTTPException(403, "You can only simulate fire on your own organization's gateways")
+
+    now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute("""
+        INSERT INTO sensor_readings
+        (gateway_id, node_id, timestamp, local_timestamp,
+         temperature, humidity, flame, smoke,
+         latitude, longitude, rssi, snr, ai_prediction, confidence)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        gateway_id, node_id, now, now,
+        52.3, 25, 1, 920,
+        16.0435, 120.3351,
+        -68, 7.2,
+        'fire', 0.95
+    ))
+    conn.commit()
+    cur.close(); conn.close()
+
+    await manager.broadcast({
+        "type":          "incident_update",
+        "node_id":       node_id,
+        "gateway_id":    gateway_id,
+        "ai_prediction": "fire",
+        "confidence":    0.95,
+        "timestamp":     now,
+        "latitude":      16.0435,
+        "longitude":     120.3351,
+    })
+
+    return {"message": f"Fire simulated on {node_id} via {gateway_id}", "timestamp": now}
+
+@app.post("/dev/simulate-normal")
+async def simulate_normal(
+    node_id: str = "Node1",
+    gateway_id: str = "GW1",
+    current_user: dict = Depends(get_current_user)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    is_admin = current_user.get('is_admin') == 1
+    user_org = current_user.get('org_id')
+
+    if not is_admin:
+        cur.execute(
+            "SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,)
+        )
+        gw = cur.fetchone()
+        if not gw:
+            cur.close(); conn.close()
+            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
+        if gw['org_id'] != user_org:
+            cur.close(); conn.close()
+            raise HTTPException(403, "You can only simulate on your own organization's gateways")
+
+    now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    cur.execute("""
+        INSERT INTO sensor_readings
+        (gateway_id, node_id, timestamp, local_timestamp,
+         temperature, humidity, flame, smoke,
+         latitude, longitude, rssi, snr, ai_prediction, confidence)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        gateway_id, node_id, now, now,
+        24.5, 61, 0, 0,        # normal room temp, no flame, no smoke
+        16.0435, 120.3351,
+        -68, 7.2,
+        'normal', 0.99
+    ))
+    conn.commit()
+    cur.close(); conn.close()
+
+    await manager.broadcast({
+        "type":          "new_reading",
+        "node_id":       node_id,
+        "gateway_id":    gateway_id,
+        "ai_prediction": "normal",
+        "confidence":    0.99,
+        "timestamp":     now,
+        "latitude":      16.0435,
+        "longitude":     120.3351,
+    })
+
+    return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
+
+#----end of simulation endpoints----
