@@ -218,15 +218,17 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     user_org = current_user.get('org_id')
 
     LATEST = """
-        (SELECT temperature   FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
-        (SELECT humidity      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
-        (SELECT flame         FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS flame,
-        (SELECT smoke         FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS smoke,
-        (SELECT latitude      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS latitude,
-        (SELECT longitude     FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
-        (SELECT rssi          FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
-        (SELECT snr           FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
-        (SELECT timestamp     FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp
+        (SELECT temperature    FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
+        (SELECT humidity       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
+        (SELECT flame          FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS flame,
+        (SELECT smoke          FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS smoke,
+        (SELECT latitude       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS latitude,
+        (SELECT longitude      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
+        (SELECT rssi           FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
+        (SELECT snr            FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
+        (SELECT timestamp      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp,
+        (SELECT ai_prediction  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS ai_prediction,
+        (SELECT confidence     FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS confidence
     """
 
     if is_admin:
@@ -794,18 +796,6 @@ async def create_invite_code_for_org(
 async def notify_new_data(data: dict):
     await manager.broadcast(data)
     return {"status": "broadcasted"}
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        proxy_headers=True,
-        forwarded_allow_ips="*"
-    )
     
     
 #---simulation for fire----
@@ -920,3 +910,17 @@ async def simulate_normal(
     return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
 
 #----end of simulation endpoints----
+
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        proxy_headers=True,
+        forwarded_allow_ips="*"
+    )
