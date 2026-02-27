@@ -116,6 +116,21 @@ def convert_to_ph_time(db_timestamp):
         print(f"Timezone conversion error: {e}")
         return str(db_timestamp)
 
+def format_local_timestamp(ts):
+    """
+    Use this for columns that are already stored in PH time (e.g. local_timestamp).
+    Avoids the double-conversion bug that convert_to_ph_time causes on naive PH datetimes.
+    """
+    if not ts:
+        return "N/A"
+    try:
+        if isinstance(ts, str):
+            return ts
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        print(f"format_local_timestamp error: {e}")
+        return str(ts)
+
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -195,7 +210,7 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
     cur.execute("""
-        SELECT id, node_id, timestamp, temperature, humidity, flame, smoke,
+        SELECT id, node_id, timestamp, local_timestamp, temperature, humidity, flame, smoke,
                latitude, longitude, rssi, snr, ai_prediction, confidence
         FROM sensor_readings
         WHERE node_id = %s
@@ -504,13 +519,13 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     user_org = current_user.get('org_id')
 
     # Pure AI judgment: only show nodes whose LATEST reading was predicted as 'fire'.
-    # No manual confidence thresholds here — the AI model already decided via the worker.
-    # The confidence value is used only for display (coloring the badge), not for filtering.
+    # local_timestamp is already in PH time — use it directly to avoid double-conversion.
     if is_admin:
         cur.execute("""
             SELECT
                 sr.node_id,
                 sr.timestamp,
+                sr.local_timestamp,
                 sr.temperature,
                 sr.humidity,
                 sr.flame,
@@ -538,6 +553,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             SELECT
                 sr.node_id,
                 sr.timestamp,
+                sr.local_timestamp,
                 sr.temperature,
                 sr.humidity,
                 sr.flame,
@@ -567,17 +583,21 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     incidents = []
     for row in rows:
         confidence_val = float(row['confidence']) if row['confidence'] is not None else 0.0
-        # Normalize: model stores confidence as 0.0–1.0
         confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
 
-        # Status label is purely for display — reflects how confident the AI was,
-        # but the incident is shown regardless because AI said 'fire'
         if confidence_pct >= 0.70:
             inc_status, status_class = "Active",    "txt-active"
         elif confidence_pct >= 0.40:
             inc_status, status_class = "Possible",  "txt-contained"
         else:
             inc_status, status_class = "Detected",  "txt-contained"
+
+        # Prefer local_timestamp (already PH time, no conversion needed).
+        # Fall back to convert_to_ph_time on the raw timestamp if local_timestamp is missing.
+        if row.get("local_timestamp"):
+            display_time = format_local_timestamp(row["local_timestamp"])
+        else:
+            display_time = convert_to_ph_time(row["timestamp"])
 
         incidents.append({
             "node_id":        row["node_id"],
@@ -592,11 +612,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "temperature":    row["temperature"],
             "smoke":          row["smoke"],
             "flame":          row["flame"],
-            "timestamp":      (
-                                row["local_timestamp"].strftime("%Y-%m-%d %H:%M:%S")
-                                if row.get("local_timestamp")
-                                else convert_to_ph_time(row["timestamp"])
-                              ),
+            "timestamp":      display_time,
             "assigned_team":  None,
         })
     return incidents
@@ -800,20 +816,18 @@ async def create_invite_code_for_org(
 async def notify_new_data(data: dict):
     await manager.broadcast(data)
     return {"status": "broadcasted"}
-    
-    
+
+
 #---simulation for fire----
 @app.post("/dev/simulate-fire")
 async def simulate_fire(
     node_id: str = "Node1",
     gateway_id: str = "GW1",
-    current_user: dict = Depends(get_current_user)  # any logged-in user
+    current_user: dict = Depends(get_current_user)
 ):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
 
-    # Optional but good: verify the gateway actually belongs to the user's org
-    # so a member can't simulate fire on another org's gateway
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
 
@@ -892,7 +906,7 @@ async def simulate_normal(
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         gateway_id, node_id, now, now,
-        24.5, 61, 0, 0,        # normal room temp, no flame, no smoke
+        24.5, 61, 0, 0,
         16.0435, 120.3351,
         -68, 7.2,
         'normal', 0.99
@@ -914,7 +928,6 @@ async def simulate_normal(
     return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
 
 #----end of simulation endpoints----
-
 
 
 if __name__ == "__main__":
