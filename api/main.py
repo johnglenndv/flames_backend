@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import secrets, string
-from typing import List, Optional   # ← added Optional
+from typing import List, Optional
 
 #-------WEBSOCKET MANAGER START HERE----------------
 class ConnectionManager:
@@ -52,17 +52,15 @@ class GatewayCreate(BaseModel):
     latitude: float | None = None
     longitude: float | None = None
 
-# ── CHANGED: removed invite_code_expires_days, added invite_code as permanent
 class OrganizationCreate(BaseModel):
     name: str
-    invite_code: str | None = None   # permanent code set by admin; NULL = no org-level code
+    invite_code: str | None = None
 
 class InviteCodeCreate(BaseModel):
     code: str | None = None
     expires_days: int = 30
     max_uses: int = 1
 
-# ── NEW: body for PATCH /gateways/{id}/assign-org
 class AssignOrgBody(BaseModel):
     org_id: int
 
@@ -387,8 +385,6 @@ async def assign_gateway_to_org(
     return {"message": f"Gateway '{gateway_id}' assigned to org {body.org_id}"}
 
 
-# ── NEW: PATCH /gateways/{gateway_id}/disassociate-org
-#    Sets org_id = NULL — removes gateway from any organization
 @app.patch("/gateways/{gateway_id}/disassociate-org")
 async def disassociate_gateway_from_org(
     gateway_id: str,
@@ -496,6 +492,7 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
     return {"message": "Organization deleted"}
 #--------------------DELETION END HERE-------------------
 
+
 @app.get("/incidents/active")
 async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -504,6 +501,9 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
 
+    # Pure AI judgment: only show nodes whose LATEST reading was predicted as 'fire'.
+    # No manual confidence thresholds here — the AI model already decided via the worker.
+    # The confidence value is used only for display (coloring the badge), not for filtering.
     if is_admin:
         cur.execute("""
             SELECT
@@ -524,8 +524,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 FROM sensor_readings
                 GROUP BY node_id
             ) latest ON sr.node_id = latest.node_id AND sr.id = latest.max_id
-            WHERE sr.ai_prediction = 'fire'
-               OR (sr.ai_prediction = 'FALSE' AND sr.confidence < 0.3)
+            WHERE LOWER(sr.ai_prediction) = 'fire'
             ORDER BY sr.timestamp DESC
             LIMIT 20
         """)
@@ -554,8 +553,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 WHERE g.org_id = %s
                 GROUP BY sr2.node_id
             ) latest ON sr.node_id = latest.node_id AND sr.id = latest.max_id
-            WHERE sr.ai_prediction = 'fire'
-               OR (sr.ai_prediction = 'FALSE' AND sr.confidence < 0.3)
+            WHERE LOWER(sr.ai_prediction) = 'fire'
             ORDER BY sr.timestamp DESC
             LIMIT 20
         """, (user_org,))
@@ -566,24 +564,25 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
 
     incidents = []
     for row in rows:
-        confidence_pct = float(row['confidence']) if row['confidence'] is not None else 0.0
-        pred = row['ai_prediction']
-        if pred == 'fire':
-            if confidence_pct >= 0.70:
-                inc_status, status_class = "Active",         "txt-active"
-            elif confidence_pct >= 0.40:
-                inc_status, status_class = "Possible",       "txt-contained"
-            else:
-                inc_status, status_class = "Low Confidence", "txt-resolved"
+        confidence_val = float(row['confidence']) if row['confidence'] is not None else 0.0
+        # Normalize: model stores confidence as 0.0–1.0
+        confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
+
+        # Status label is purely for display — reflects how confident the AI was,
+        # but the incident is shown regardless because AI said 'fire'
+        if confidence_pct >= 0.70:
+            inc_status, status_class = "Active",    "txt-active"
+        elif confidence_pct >= 0.40:
+            inc_status, status_class = "Possible",  "txt-contained"
         else:
-            inc_status, status_class    = "Normal",          "txt-resolved"
+            inc_status, status_class = "Detected",  "txt-contained"
 
         incidents.append({
             "node_id":        row["node_id"],
             "location_name":  row["location_name"],
             "latitude":       row["latitude"],
             "longitude":      row["longitude"],
-            "ai_prediction":  pred,
+            "ai_prediction":  row["ai_prediction"],
             "confidence":     confidence_pct,
             "confidence_pct": round(confidence_pct * 100, 1),
             "status":         inc_status,
@@ -595,6 +594,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "assigned_team":  None,
         })
     return incidents
+
 
 # ── Pinned Locations ──────────────────────────────────
 @app.get("/me/pins")
