@@ -78,6 +78,10 @@ class InviteCodeAdminCreate(BaseModel):
 class ResolveIncidentBody(BaseModel):
     notes: str | None = None
 
+class RespondIncidentBody(BaseModel):
+    organization_id: int | None = None
+    organization_name: str | None = None
+
 #-----DATA MODELS END HERE----------------
 
 
@@ -721,7 +725,6 @@ async def get_incident_history(
     return rows
 
 
-# ── NEW: GET /incidents/resolved ──────────────────────────────
 @app.get("/incidents/resolved")
 async def get_resolved_incidents(
     limit: int = 100,
@@ -766,7 +769,6 @@ async def get_resolved_incidents(
     for row in rows:
         confidence_val = float(row["confidence"]) if row.get("confidence") is not None else 0.0
         confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
-        pred = (row.get("ai_prediction") or "").lower()
 
         result.append({
             "incident_id":    row["id"],
@@ -791,6 +793,95 @@ async def get_resolved_incidents(
     return result
 
 
+# ── GET single incident by ID ──────────────────────────────────
+@app.get("/incidents/{incident_id}")
+async def get_incident_by_id(
+    incident_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT fi.*,
+               CONCAT('Node ', fi.node_id) AS location_name
+        FROM fire_incidents fi
+        WHERE fi.id = %s
+        LIMIT 1
+    """, (incident_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+
+    if not row:
+        raise HTTPException(404, "Incident not found")
+
+    confidence_val = float(row["confidence"]) if row.get("confidence") is not None else 0.0
+    confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
+    pred = (row.get("ai_prediction") or "").lower()
+
+    return {
+        "incident_id":    row["id"],
+        "node_id":        row["node_id"],
+        "gateway_id":     row.get("gateway_id"),
+        "location_name":  row["location_name"],
+        "latitude":       row.get("latitude"),
+        "longitude":      row.get("longitude"),
+        "ai_prediction":  row.get("ai_prediction"),
+        "confidence":     confidence_pct,
+        "confidence_pct": round(confidence_pct * 100, 1),
+        "status":         row.get("status"),
+        "temperature":    row.get("temperature"),
+        "humidity":       row.get("humidity"),
+        "smoke":          row.get("smoke"),
+        "flame":          row.get("flame"),
+        "notes":          row.get("notes"),
+        "assigned_team":  row.get("assigned_team"),
+        "timestamp":      format_local_timestamp(row.get("last_updated_at")),
+        "started_at":     format_local_timestamp(row.get("started_at")),
+        "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
+    }
+
+
+@app.patch("/incidents/{incident_id}/respond")
+async def respond_to_incident(
+    incident_id: int,
+    body: RespondIncidentBody,
+    current_user: dict = Depends(get_current_user)
+):
+    """Mark an organization as responding to an incident."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("SELECT id, node_id, status FROM fire_incidents WHERE id = %s", (incident_id,))
+    inc = cur.fetchone()
+    if not inc:
+        cur.close(); conn.close()
+        raise HTTPException(404, "Incident not found")
+
+    assigned_team = body.organization_name or str(body.organization_id) or "Unknown"
+    cur.execute("""
+        UPDATE fire_incidents SET assigned_team = %s WHERE id = %s
+    """, (assigned_team, incident_id))
+    conn.commit()
+
+    node_id = inc["node_id"]
+    cur.close(); conn.close()
+
+    # Broadcast to all connected clients so they update immediately
+    await manager.broadcast({
+        "type":        "incident_update",
+        "incident_id": incident_id,
+        "action":      "responded",
+        "node_id":     node_id,
+        "org_name":    assigned_team,
+    })
+    await manager.broadcast({
+        "type":    "node_update",
+        "node_id": node_id,
+    })
+
+    return {"message": f"Incident {incident_id} assigned to {assigned_team}"}
+
+
 @app.patch("/incidents/{incident_id}/resolve")
 async def resolve_incident(
     incident_id: int,
@@ -802,7 +893,7 @@ async def resolve_incident(
     cur = conn.cursor(dictionary=True)
     now_str = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-    cur.execute("SELECT id, status FROM fire_incidents WHERE id = %s", (incident_id,))
+    cur.execute("SELECT id, node_id, status FROM fire_incidents WHERE id = %s", (incident_id,))
     inc = cur.fetchone()
     if not inc:
         cur.close(); conn.close()
@@ -810,6 +901,8 @@ async def resolve_incident(
     if inc["status"] == "resolved":
         cur.close(); conn.close()
         raise HTTPException(400, "Incident is already resolved")
+
+    node_id = inc["node_id"]
 
     cur.execute("""
         UPDATE fire_incidents
@@ -819,11 +912,20 @@ async def resolve_incident(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast incident resolved — includes node_id and action so all clients
+    # can immediately remove the fire animation without waiting for the poll cycle
     await manager.broadcast({
         "type":        "incident_update",
         "incident_id": incident_id,
         "action":      "resolved",
+        "node_id":     node_id,
     })
+    # Also broadcast a node_update so loadAndPlaceNodes() fires on all clients
+    await manager.broadcast({
+        "type":    "node_update",
+        "node_id": node_id,
+    })
+
     return {"message": f"Incident {incident_id} resolved", "resolved_at": now_str}
 
 
@@ -1087,6 +1189,7 @@ async def simulate_fire(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
@@ -1096,6 +1199,10 @@ async def simulate_fire(
         "timestamp":     now,
         "latitude":      16.0435,
         "longitude":     120.3351,
+    })
+    await manager.broadcast({
+        "type":    "node_update",
+        "node_id": node_id,
     })
 
     return {"message": f"Fire simulated on {node_id} via {gateway_id}", "timestamp": now}
@@ -1153,6 +1260,7 @@ async def simulate_false(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
@@ -1162,6 +1270,10 @@ async def simulate_false(
         "timestamp":     now,
         "latitude":      16.0435,
         "longitude":     120.3351,
+    })
+    await manager.broadcast({
+        "type":    "node_update",
+        "node_id": node_id,
     })
 
     return {"message": f"'False' prediction simulated on {node_id} via {gateway_id}", "timestamp": now}
@@ -1212,8 +1324,9 @@ async def simulate_normal(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
-        "type":          "new_reading",
+        "type":          "incident_update",
         "node_id":       node_id,
         "gateway_id":    gateway_id,
         "ai_prediction": "normal",
@@ -1222,9 +1335,17 @@ async def simulate_normal(
         "latitude":      16.0435,
         "longitude":     120.3351,
     })
+    await manager.broadcast({
+        "type":    "node_update",
+        "node_id": node_id,
+    })
 
     return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
 
+
+# ══════════════════════════════════════════════════════════════
+#  ORG DROPDOWN
+# ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
