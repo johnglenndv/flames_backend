@@ -75,6 +75,9 @@ class InviteCodeAdminCreate(BaseModel):
     expires_days: int = 30
     max_uses: int = 1
 
+class ResolveIncidentBody(BaseModel):
+    notes: str | None = None
+
 #-----DATA MODELS END HERE----------------
 
 
@@ -118,8 +121,8 @@ def convert_to_ph_time(db_timestamp):
 
 def format_local_timestamp(ts):
     """
-    Use this for columns that are already stored in PH time (e.g. local_timestamp).
-    Avoids the double-conversion bug that convert_to_ph_time causes on naive PH datetimes.
+    For columns already stored in PH time (local_timestamp / started_at from fire_incidents).
+    Avoids the double-conversion bug in convert_to_ph_time on naive PH datetimes.
     """
     if not ts:
         return "N/A"
@@ -172,6 +175,91 @@ async def admin_required(current_user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
 #-----UTILITY FUNCTIONS END HERE----------------
+
+# ──────────────────────────────────────────────────────────────
+#  FIRE INCIDENT HELPER
+#  Called whenever a sensor reading arrives with prediction
+#  'fire' or 'false'.  Creates a new incident row or updates
+#  the existing active one for that node.
+# ──────────────────────────────────────────────────────────────
+def upsert_fire_incident(cur, reading: dict):
+    """
+    reading must contain:
+        node_id, gateway_id, ai_prediction, confidence,
+        temperature, humidity, flame, smoke,
+        latitude, longitude, local_timestamp (str, already PH time)
+    """
+    pred       = (reading.get("ai_prediction") or "").lower()
+    node_id    = reading.get("node_id")
+    gateway_id = reading.get("gateway_id")
+    now_str    = reading.get("local_timestamp") or \
+                 datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+    if pred not in ("fire", "false"):
+        # Not an alert — if there's an active incident for this node, resolve it
+        cur.execute("""
+            UPDATE fire_incidents
+            SET status = 'resolved', resolved_at = %s
+            WHERE node_id = %s AND status = 'active'
+        """, (now_str, node_id))
+        return
+
+    # Check for an existing active incident on this node
+    cur.execute("""
+        SELECT id FROM fire_incidents
+        WHERE node_id = %s AND status = 'active'
+        LIMIT 1
+    """, (node_id,))
+    existing = cur.fetchone()
+
+    if existing:
+        # Update snapshot with the latest reading
+        cur.execute("""
+            UPDATE fire_incidents SET
+                ai_prediction   = %s,
+                confidence      = %s,
+                temperature     = %s,
+                humidity        = %s,
+                flame           = %s,
+                smoke           = %s,
+                latitude        = %s,
+                longitude       = %s,
+                last_updated_at = %s
+            WHERE id = %s
+        """, (
+            pred,
+            reading.get("confidence", 0),
+            reading.get("temperature"),
+            reading.get("humidity"),
+            reading.get("flame"),
+            reading.get("smoke"),
+            reading.get("latitude"),
+            reading.get("longitude"),
+            now_str,
+            existing["id"],
+        ))
+    else:
+        # Open a brand-new incident
+        cur.execute("""
+            INSERT INTO fire_incidents
+                (node_id, gateway_id, ai_prediction, confidence,
+                 temperature, humidity, flame, smoke,
+                 latitude, longitude, status, started_at, last_updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)
+        """, (
+            node_id,
+            gateway_id,
+            pred,
+            reading.get("confidence", 0),
+            reading.get("temperature"),
+            reading.get("humidity"),
+            reading.get("flame"),
+            reading.get("smoke"),
+            reading.get("latitude"),
+            reading.get("longitude"),
+            now_str,
+            now_str,
+        ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
 @app.websocket("/ws")
@@ -346,9 +434,7 @@ async def get_gateways(
         if org_id is not None:
             cur.execute("""
                 SELECT gateway_id, org_id, location_name, latitude, longitude, created_at
-                FROM gateways
-                WHERE org_id = %s
-                ORDER BY gateway_id
+                FROM gateways WHERE org_id = %s ORDER BY gateway_id
             """, (org_id,))
         else:
             cur.execute("""
@@ -365,9 +451,7 @@ async def get_gateways(
             return []
         cur.execute("""
             SELECT gateway_id, org_id, location_name, latitude, longitude, created_at
-            FROM gateways
-            WHERE org_id = %s
-            ORDER BY gateway_id
+            FROM gateways WHERE org_id = %s ORDER BY gateway_id
         """, (user_org,))
 
     gateways = cur.fetchall()
@@ -510,6 +594,11 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
 #--------------------DELETION END HERE-------------------
 
 
+# ══════════════════════════════════════════════════════════════
+#  INCIDENTS — now sourced from fire_incidents table
+#  Shows both 'fire' (red Active) and 'false' (yellow Possible)
+# ══════════════════════════════════════════════════════════════
+
 @app.get("/incidents/active")
 async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
@@ -518,32 +607,28 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
 
-    # Pure AI judgment: only show nodes whose LATEST reading was predicted as 'fire'.
-    # local_timestamp is already in PH time — use it directly to avoid double-conversion.
     if is_admin:
         cur.execute("""
             SELECT
-                sr.node_id,
-                sr.timestamp,
-                sr.local_timestamp,
-                sr.temperature,
-                sr.humidity,
-                sr.flame,
-                sr.smoke,
-                sr.latitude,
-                sr.longitude,
-                sr.ai_prediction,
-                sr.confidence,
-                CONCAT('Node ', sr.node_id) AS location_name
-            FROM sensor_readings sr
-            INNER JOIN (
-                SELECT node_id, MAX(id) AS max_id
-                FROM sensor_readings
-                GROUP BY node_id
-            ) latest ON sr.node_id = latest.node_id AND sr.id = latest.max_id
-            WHERE LOWER(sr.ai_prediction) = 'fire'
-            ORDER BY sr.timestamp DESC
-            LIMIT 20
+                fi.id            AS incident_id,
+                fi.node_id,
+                fi.gateway_id,
+                fi.ai_prediction,
+                fi.confidence,
+                fi.temperature,
+                fi.humidity,
+                fi.flame,
+                fi.smoke,
+                fi.latitude,
+                fi.longitude,
+                fi.started_at,
+                fi.last_updated_at,
+                fi.assigned_team,
+                CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            WHERE fi.status = 'active'
+            ORDER BY fi.last_updated_at DESC
+            LIMIT 50
         """)
     else:
         if not user_org:
@@ -551,29 +636,27 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             return []
         cur.execute("""
             SELECT
-                sr.node_id,
-                sr.timestamp,
-                sr.local_timestamp,
-                sr.temperature,
-                sr.humidity,
-                sr.flame,
-                sr.smoke,
-                sr.latitude,
-                sr.longitude,
-                sr.ai_prediction,
-                sr.confidence,
-                CONCAT('Node ', sr.node_id) AS location_name
-            FROM sensor_readings sr
-            INNER JOIN (
-                SELECT sr2.node_id, MAX(sr2.id) AS max_id
-                FROM sensor_readings sr2
-                INNER JOIN gateways g ON g.gateway_id = sr2.gateway_id
-                WHERE g.org_id = %s
-                GROUP BY sr2.node_id
-            ) latest ON sr.node_id = latest.node_id AND sr.id = latest.max_id
-            WHERE LOWER(sr.ai_prediction) = 'fire'
-            ORDER BY sr.timestamp DESC
-            LIMIT 20
+                fi.id            AS incident_id,
+                fi.node_id,
+                fi.gateway_id,
+                fi.ai_prediction,
+                fi.confidence,
+                fi.temperature,
+                fi.humidity,
+                fi.flame,
+                fi.smoke,
+                fi.latitude,
+                fi.longitude,
+                fi.started_at,
+                fi.last_updated_at,
+                fi.assigned_team,
+                CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
+            WHERE fi.status = 'active'
+              AND g.org_id = %s
+            ORDER BY fi.last_updated_at DESC
+            LIMIT 50
         """, (user_org,))
 
     rows = cur.fetchall()
@@ -582,24 +665,22 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
 
     incidents = []
     for row in rows:
-        confidence_val = float(row['confidence']) if row['confidence'] is not None else 0.0
+        pred          = (row["ai_prediction"] or "").lower()
+        confidence_val = float(row["confidence"]) if row["confidence"] is not None else 0.0
         confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
 
-        if confidence_pct >= 0.70:
-            inc_status, status_class = "Active",    "txt-active"
-        elif confidence_pct >= 0.40:
-            inc_status, status_class = "Possible",  "txt-contained"
+        # 'fire'  → red   Active
+        # 'false' → yellow Possible Fire
+        if pred == "fire":
+            inc_status   = "Active"
+            status_class = "txt-active"
         else:
-            inc_status, status_class = "Detected",  "txt-contained"
-
-        # Prefer local_timestamp (already PH time, no conversion needed).
-        # Fall back to convert_to_ph_time on the raw timestamp if local_timestamp is missing.
-        if row.get("local_timestamp"):
-            display_time = format_local_timestamp(row["local_timestamp"])
-        else:
-            display_time = convert_to_ph_time(row["timestamp"])
+            # pred == 'false'
+            inc_status   = "Possible Fire"
+            status_class = "txt-contained"
 
         incidents.append({
+            "incident_id":    row["incident_id"],
             "node_id":        row["node_id"],
             "location_name":  row["location_name"],
             "latitude":       row["latitude"],
@@ -612,10 +693,93 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "temperature":    row["temperature"],
             "smoke":          row["smoke"],
             "flame":          row["flame"],
-            "timestamp":      display_time,
-            "assigned_team":  None,
+            # started_at is stored as PH time — use directly
+            "timestamp":      format_local_timestamp(row["last_updated_at"]),
+            "started_at":     format_local_timestamp(row["started_at"]),
+            "assigned_team":  row["assigned_team"],
         })
     return incidents
+
+
+@app.get("/incidents/history")
+async def get_incident_history(
+    limit: int = 100,
+    current_user: dict = Depends(get_current_user)
+):
+    """Returns both active and resolved incidents for history/audit."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    is_admin = current_user.get('is_admin') == 1
+    user_org = current_user.get('org_id')
+
+    if is_admin:
+        cur.execute("""
+            SELECT fi.*,
+                   CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            ORDER BY fi.started_at DESC
+            LIMIT %s
+        """, (limit,))
+    else:
+        if not user_org:
+            cur.close(); conn.close()
+            return []
+        cur.execute("""
+            SELECT fi.*,
+                   CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
+            WHERE g.org_id = %s
+            ORDER BY fi.started_at DESC
+            LIMIT %s
+        """, (user_org, limit))
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    for row in rows:
+        row["started_at"]      = format_local_timestamp(row["started_at"])
+        row["last_updated_at"] = format_local_timestamp(row["last_updated_at"])
+        row["resolved_at"]     = format_local_timestamp(row["resolved_at"]) if row.get("resolved_at") else None
+    return rows
+
+
+@app.patch("/incidents/{incident_id}/resolve")
+async def resolve_incident(
+    incident_id: int,
+    body: ResolveIncidentBody,
+    current_user: dict = Depends(get_current_user)
+):
+    """Manually resolve an active fire incident."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+    now_str = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("SELECT id, status FROM fire_incidents WHERE id = %s", (incident_id,))
+    inc = cur.fetchone()
+    if not inc:
+        cur.close(); conn.close()
+        raise HTTPException(404, "Incident not found")
+    if inc["status"] == "resolved":
+        cur.close(); conn.close()
+        raise HTTPException(400, "Incident is already resolved")
+
+    cur.execute("""
+        UPDATE fire_incidents
+        SET status = 'resolved', resolved_at = %s, notes = %s
+        WHERE id = %s
+    """, (now_str, body.notes, incident_id))
+    conn.commit()
+    cur.close(); conn.close()
+
+    await manager.broadcast({
+        "type":        "incident_update",
+        "incident_id": incident_id,
+        "action":      "resolved",
+    })
+    return {"message": f"Incident {incident_id} resolved", "resolved_at": now_str}
 
 
 # ── Pinned Locations ──────────────────────────────────
@@ -733,7 +897,11 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/gateways")
-async def register_gateway(gateway: GatewayCreate, current_user: dict = Depends(get_current_user), _admin: dict = Depends(admin_required)):
+async def register_gateway(
+    gateway: GatewayCreate,
+    current_user: dict = Depends(get_current_user),
+    _admin: dict = Depends(admin_required)
+):
     conn = mysql.connector.connect(**DB_CONFIG)
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT id FROM gateways WHERE gateway_id = %s", (gateway.gateway_id,))
@@ -743,9 +911,9 @@ async def register_gateway(gateway: GatewayCreate, current_user: dict = Depends(
     cur.execute("""
         INSERT INTO gateways (gateway_id, org_id, location_name, latitude, longitude, created_by)
         VALUES (%s, %s, %s, %s, %s, %s)
-    """, (gateway.gateway_id, current_user['org_id'], gateway.location_name, gateway.latitude, gateway.longitude, current_user['id']))
+    """, (gateway.gateway_id, current_user['org_id'], gateway.location_name,
+          gateway.latitude, gateway.longitude, current_user['id']))
     conn.commit()
-    new_id = cur.lastrowid
     cur.close(); conn.close()
     return {
         "message":         "Gateway registered successfully",
@@ -818,7 +986,11 @@ async def notify_new_data(data: dict):
     return {"status": "broadcasted"}
 
 
-#---simulation for fire----
+# ══════════════════════════════════════════════════════════════
+#  SIMULATION ENDPOINTS
+#  Now also write to fire_incidents via upsert_fire_incident()
+# ══════════════════════════════════════════════════════════════
+
 @app.post("/dev/simulate-fire")
 async def simulate_fire(
     node_id: str = "Node1",
@@ -832,9 +1004,7 @@ async def simulate_fire(
     user_org = current_user.get('org_id')
 
     if not is_admin:
-        cur.execute(
-            "SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,)
-        )
+        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
         gw = cur.fetchone()
         if not gw:
             cur.close(); conn.close()
@@ -844,19 +1014,34 @@ async def simulate_fire(
             raise HTTPException(403, "You can only simulate fire on your own organization's gateways")
 
     now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+    # Insert into sensor_readings
     cur.execute("""
         INSERT INTO sensor_readings
         (gateway_id, node_id, timestamp, local_timestamp,
          temperature, humidity, flame, smoke,
          latitude, longitude, rssi, snr, ai_prediction, confidence)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        gateway_id, node_id, now, now,
-        52.3, 25, 1, 920,
-        16.0435, 120.3351,
-        -68, 7.2,
-        'fire', 0.95
-    ))
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (gateway_id, node_id, now, now,
+          52.3, 25, 1, 920,
+          16.0435, 120.3351,
+          -68, 7.2, 'fire', 0.95))
+
+    # Upsert into fire_incidents
+    upsert_fire_incident(cur, {
+        "node_id":        node_id,
+        "gateway_id":     gateway_id,
+        "ai_prediction":  "fire",
+        "confidence":     0.95,
+        "temperature":    52.3,
+        "humidity":       25,
+        "flame":          1,
+        "smoke":          920,
+        "latitude":       16.0435,
+        "longitude":      120.3351,
+        "local_timestamp": now,
+    })
+
     conn.commit()
     cur.close(); conn.close()
 
@@ -873,6 +1058,74 @@ async def simulate_fire(
 
     return {"message": f"Fire simulated on {node_id} via {gateway_id}", "timestamp": now}
 
+
+@app.post("/dev/simulate-false")
+async def simulate_false(
+    node_id: str = "Node1",
+    gateway_id: str = "GW1",
+    current_user: dict = Depends(get_current_user)
+):
+    """Simulates a 'false' (possible fire) prediction."""
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    is_admin = current_user.get('is_admin') == 1
+    user_org = current_user.get('org_id')
+
+    if not is_admin:
+        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
+        gw = cur.fetchone()
+        if not gw:
+            cur.close(); conn.close()
+            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
+        if gw['org_id'] != user_org:
+            cur.close(); conn.close()
+            raise HTTPException(403, "You can only simulate on your own organization's gateways")
+
+    now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("""
+        INSERT INTO sensor_readings
+        (gateway_id, node_id, timestamp, local_timestamp,
+         temperature, humidity, flame, smoke,
+         latitude, longitude, rssi, snr, ai_prediction, confidence)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (gateway_id, node_id, now, now,
+          38.5, 40, 1, 450,
+          16.0435, 120.3351,
+          -68, 7.2, 'false', 0.55))
+
+    upsert_fire_incident(cur, {
+        "node_id":        node_id,
+        "gateway_id":     gateway_id,
+        "ai_prediction":  "false",
+        "confidence":     0.55,
+        "temperature":    38.5,
+        "humidity":       40,
+        "flame":          1,
+        "smoke":          450,
+        "latitude":       16.0435,
+        "longitude":      120.3351,
+        "local_timestamp": now,
+    })
+
+    conn.commit()
+    cur.close(); conn.close()
+
+    await manager.broadcast({
+        "type":          "incident_update",
+        "node_id":       node_id,
+        "gateway_id":    gateway_id,
+        "ai_prediction": "false",
+        "confidence":    0.55,
+        "timestamp":     now,
+        "latitude":      16.0435,
+        "longitude":     120.3351,
+    })
+
+    return {"message": f"'False' prediction simulated on {node_id} via {gateway_id}", "timestamp": now}
+
+
 @app.post("/dev/simulate-normal")
 async def simulate_normal(
     node_id: str = "Node1",
@@ -886,9 +1139,7 @@ async def simulate_normal(
     user_org = current_user.get('org_id')
 
     if not is_admin:
-        cur.execute(
-            "SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,)
-        )
+        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
         gw = cur.fetchone()
         if not gw:
             cur.close(); conn.close()
@@ -898,19 +1149,26 @@ async def simulate_normal(
             raise HTTPException(403, "You can only simulate on your own organization's gateways")
 
     now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
     cur.execute("""
         INSERT INTO sensor_readings
         (gateway_id, node_id, timestamp, local_timestamp,
          temperature, humidity, flame, smoke,
          latitude, longitude, rssi, snr, ai_prediction, confidence)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        gateway_id, node_id, now, now,
-        24.5, 61, 0, 0,
-        16.0435, 120.3351,
-        -68, 7.2,
-        'normal', 0.99
-    ))
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (gateway_id, node_id, now, now,
+          24.5, 61, 0, 0,
+          16.0435, 120.3351,
+          -68, 7.2, 'normal', 0.99))
+
+    # Normal reading → auto-resolve any active incident for this node
+    upsert_fire_incident(cur, {
+        "node_id":        node_id,
+        "gateway_id":     gateway_id,
+        "ai_prediction":  "normal",
+        "local_timestamp": now,
+    })
+
     conn.commit()
     cur.close(); conn.close()
 
@@ -926,8 +1184,6 @@ async def simulate_normal(
     })
 
     return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
-
-#----end of simulation endpoints----
 
 
 if __name__ == "__main__":
