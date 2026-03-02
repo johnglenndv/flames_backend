@@ -85,8 +85,17 @@ def on_message(client, userdata, msg):
             print("Missing node id → skipping message")
             return
 
-        # Extract sensor fields
-        ph_timestamp = wrapper.get("received_at")
+        # Extract timestamps (both come from the gateway MQTT message)
+        received_at_final = wrapper.get("received_at")          # after processing + ACK
+        received_at_early = wrapper.get("received_at_early")    # right after IRQ / packet RX
+
+        # Fallback if somehow missing (very rare)
+        if received_at_final is None:
+            received_at_final = datetime.utcnow().isoformat()   # emergency fallback
+
+        if received_at_early is None:
+            received_at_early = received_at_final               # best effort
+
         temp  = payload.get("temp")
         hum   = payload.get("hum")
         flame = payload.get("flame", 0)
@@ -124,7 +133,7 @@ def on_message(client, userdata, msg):
             """
             cur.execute(sql, (
                 gateway_id, node,
-                ph_timestamp, ph_timestamp,
+                received_at_final, received_at_early,
                 temp, hum, flame, smoke,
                 lat, lon, rssi, snr,
                 final_label, confidence
@@ -137,7 +146,7 @@ def on_message(client, userdata, msg):
                 "type":          "new_reading",   # ← was missing before
                 "node_id":       node,
                 "gateway_id":    gateway_id,
-                "timestamp":     ph_timestamp,
+                "timestamp":     received_at_early,  # use the earliest timestamp for real-time display
                 "temperature":   temp,
                 "humidity":      hum,
                 "flame":         flame,
@@ -174,7 +183,7 @@ def on_message(client, userdata, msg):
                     "gateway_id":    gateway_id,
                     "ai_prediction": final_label,
                     "confidence":    confidence,
-                    "timestamp":     ph_timestamp,
+                    "timestamp":     received_at_early,
                     "latitude":      lat,
                     "longitude":     lon,
                 }
