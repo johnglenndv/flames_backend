@@ -314,6 +314,7 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
         (SELECT rssi           FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
         (SELECT snr            FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
         (SELECT timestamp      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp,
+        (SELECT local_timestamp FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS local_timestamp,
         (SELECT ai_prediction  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS ai_prediction,
         (SELECT confidence     FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS confidence
     """
