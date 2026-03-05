@@ -80,7 +80,7 @@ def on_message(client, userdata, msg):
 
         # HOT DAY OVERRIDE (Safety Filter)
         # If AI says Fire but temperature is stable (dT < 0.2) and no smoke (S < 30)
-        if final_label.lower() in ["fire", "possible"]:
+        if final_label.lower() in ["fire", "false"]:
             if abs(t_delta) < 0.2 and s < 30:
                 final_label, confidence = "Normal", 0.98
 
