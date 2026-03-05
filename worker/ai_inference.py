@@ -8,7 +8,7 @@ import mysql.connector
 import requests
 from datetime import datetime
 from mysql.connector import Error
-
+# hatdog
 # --- 1. LOAD AI ASSETS ---
 try:
     model = joblib.load('fire_model.pkl')
