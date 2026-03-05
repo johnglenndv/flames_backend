@@ -1,30 +1,25 @@
-import os
-import json
-import joblib
+import os, json, joblib, requests
 import pandas as pd
 import numpy as np
 import paho.mqtt.client as mqtt
 import mysql.connector
-import requests
 from datetime import datetime
-from mysql.connector import Error
+
 # --- 1. LOAD AI ASSETS ---
 try:
-    model = joblib.load('fire_model.pkl')
-    scaler = joblib.load('scaler.pkl')
-    class_names = joblib.load('classes.pkl')
-    print("AI Model and Scaler loaded successfully.")
+    # Using the 'final' filenames from your new training script
+    model = joblib.load('fire_model_final.pkl')
+    scaler = joblib.load('scaler_final.pkl')
+    class_names = joblib.load('classes_final.pkl')
+    print("AI Assets (Temporal V4) Loaded.")
 except Exception as e:
-    print(f"AI Loading Error: {e}")
+    print(f"Loading Error: {e}")
 
-# HiveMQ config (from env vars)
+# --- 2. MEMORY & CONFIG ---
+node_history = {} 
 BROKER = os.getenv("HIVEMQ_HOST")
-PORT   = 8883
-USER   = os.getenv("HIVEMQ_USER")
-PASS   = os.getenv("HIVEMQ_PASS")
-TOPIC  = "lora/uplink"
+TOPIC = "lora/uplink"
 
-# MySQL (Railway auto-injected)
 DB_CONFIG = {
     "host": os.getenv("MYSQLHOST"),
     "port": int(os.getenv("MYSQLPORT", 3306)),
@@ -33,191 +28,117 @@ DB_CONFIG = {
     "database": os.getenv("MYSQLDATABASE"),
 }
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("MQTT connected")
-        client.subscribe(TOPIC)
-    else:
-        print(f"MQTT connect failed rc={rc}")
-
-def ensure_gateway_exists(conn, gateway_id: str):
+# --- 3. DATABASE UTILITIES ---
+def ensure_gateway_exists(conn, gateway_id):
     cur = conn.cursor()
     try:
         cur.execute("SELECT 1 FROM gateways WHERE gateway_id = %s LIMIT 1", (gateway_id,))
-        if cur.fetchone():
-            return  # already exists
-
-        now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        cur.execute("""
-            INSERT INTO gateways
-            (gateway_id, location_name, status, created_at)
-            VALUES (%s, %s, %s, %s)
-        """, (
-            gateway_id,
-            f"Gateway {gateway_id} — location & org pending",
-            "maintenance",
-            now
-        ))
-        conn.commit()
-        print(f"→ Auto-created gateway: {gateway_id} (org_id = NULL)")
-    except mysql.connector.Error as err:
-        print(f"Error creating gateway {gateway_id}: {err}")
-        conn.rollback()
+        if not cur.fetchone():
+            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            cur.execute("""
+                INSERT INTO gateways (gateway_id, location_name, status, created_at) 
+                VALUES (%s, %s, %s, %s)
+            """, (gateway_id, f"Gateway {gateway_id}", "active", now))
+            conn.commit()
+            print(f"Auto-created gateway: {gateway_id}")
     finally:
         cur.close()
 
+# --- 4. MAIN INFERENCE LOGIC ---
 def on_message(client, userdata, msg):
+    global node_history
     try:
-        raw = msg.payload.decode()
-        data = json.loads(raw)
-        print("Received:", data)
+        data = json.loads(msg.payload.decode())
+        gateway_id = data.get("gateway")
+        payload = data.get("payload", {})
+        node = payload.get("node")
 
-        wrapper    = data
-        gateway_id = wrapper.get("gateway")
-        payload    = wrapper.get("payload", {})
-        node       = payload.get("node")
+        if not gateway_id or not node: return
 
-        if not gateway_id:
-            print("Missing gateway id → skipping message")
-            return
-        if not node:
-            print("Missing node id → skipping message")
-            return
+        # 1. Extract All Vital Data (Restored)
+        t, h = payload.get("temp"), payload.get("hum")
+        f, s = payload.get("flame", 0), payload.get("smoke", 0)
+        lat, lon = payload.get("lat"), payload.get("lon")
+        rssi, snr = data.get("rssi"), data.get("snr")
+        
+        # Timestamps
+        received_at_final = data.get("received_at", datetime.utcnow().isoformat())
+        received_at_early = data.get("received_at_early", received_at_final)
 
-        # Extract timestamps (both come from the gateway MQTT message)
-        received_at_final = wrapper.get("received_at")          # after processing + ACK
-        received_at_early = wrapper.get("received_at_early")    # right after IRQ / packet RX
+        # 2. Temporal Feature Engineering
+        prev = node_history.get(node, {'temp': t, 'smoke': s, 'flame': f, 'hum': h})
+        t_delta, s_delta = t - prev['temp'], s - prev['smoke']
+        f_delta, h_delta = f - prev['flame'], h - prev['hum']
+        t_roll, s_roll = (t + prev['temp']) / 2, (s + prev['smoke']) / 2
+        
+        # Update Memory for next message
+        node_history[node] = {'temp': t, 'smoke': s, 'flame': f, 'hum': h}
 
-        # Fallback if somehow missing (very rare)
-        if received_at_final is None:
-            received_at_final = datetime.utcnow().isoformat()   # emergency fallback
+        # 3. AI Calculation (10 Features)
+        features = [s, t, f, h, t_delta, s_delta, f_delta, h_delta, t_roll, s_roll]
+        input_df = pd.DataFrame([features], columns=[
+            'smoke', 'temperature', 'flame', 'humidity', 
+            'temp_delta', 'smoke_delta', 'flame_delta', 'hum_delta', 
+            'temp_roll_avg', 'smoke_roll_avg'
+        ])
+        
+        scaled_input = scaler.transform(input_df)
+        probs = model.predict_proba(scaled_input)[0]
+        final_label = class_names[np.argmax(probs)]
+        confidence = float(np.max(probs))
 
-        if received_at_early is None:
-            received_at_early = received_at_final               # best effort
+        # Stability Override (Hot Day Fix)
+        if final_label.lower() == "possible" and abs(t_delta) < 0.1 and s < 50:
+            final_label, confidence = "Normal", 0.99
 
-        temp  = payload.get("temp")
-        hum   = payload.get("hum")
-        flame = payload.get("flame", 0)
-        smoke = payload.get("smoke", 0)
-        lat   = payload.get("lat")
-        lon   = payload.get("lon")
-        rssi  = wrapper.get("rssi")
-        snr   = wrapper.get("snr")
-
-        # --- AI INFERENCE ---
-        input_df = pd.DataFrame(
-            [[smoke, temp, flame, hum]],
-            columns=['smoke', 'temperature', 'flame', 'humidity']
-        )
-        scaled_input     = scaler.transform(input_df)
-        probabilities    = model.predict_proba(scaled_input)[0]
-        prediction_index = np.argmax(probabilities)
-        final_label      = class_names[prediction_index]
-        confidence       = float(probabilities[prediction_index])
-
-        # --- DATABASE OPERATIONS ---
+        # 4. Database Logging (All columns restored)
         conn = mysql.connector.connect(**DB_CONFIG)
-        try:
-            # 1. Ensure gateway exists
-            ensure_gateway_exists(conn, gateway_id)
+        ensure_gateway_exists(conn, gateway_id)
+        cur = conn.cursor()
+        sql = """
+            INSERT INTO sensor_readings 
+            (gateway_id, node_id, timestamp, local_timestamp, temperature, humidity, 
+             flame, smoke, latitude, longitude, rssi, snr, ai_prediction, confidence, 
+             temp_delta, smoke_delta) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cur.execute(sql, (
+            gateway_id, node, received_at_final, received_at_early, 
+            t, h, f, s, lat, lon, rssi, snr, 
+            final_label, confidence, t_delta, s_delta
+        ))
+        conn.commit()
+        cur.close()
+        conn.close()
 
-            # 2. Insert sensor reading
-            cur = conn.cursor()
-            sql = """
-                INSERT INTO sensor_readings
-                (gateway_id, node_id, timestamp, local_timestamp,
-                 temperature, humidity, flame, smoke,
-                 latitude, longitude, rssi, snr, ai_prediction, confidence)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            cur.execute(sql, (
-                gateway_id, node,
-                received_at_final, received_at_early,
-                temp, hum, flame, smoke,
-                lat, lon, rssi, snr,
-                final_label, confidence
-            ))
-            conn.commit()
+        # 5. Dashboard Notification
+        requests.post("https://flamesapp.up.railway.app/notify-new-data", json={
+            "type": "new_reading",
+            "node_id": node,
+            "gateway_id": gateway_id,
+            "ai_prediction": final_label,
+            "confidence": f"{confidence*100:.2f}%",
+            "temperature": t,
+            "humidity": h,
+            "smoke": s,
+            "flame": f,
+            "latitude": lat,
+            "longitude": lon,
+            "rssi": rssi,
+            "snr": snr,
+            "temp_delta": round(t_delta, 2)
+        }, timeout=2)
 
-            # ── FIX 1: Basic reading broadcast — added "type": "new_reading"
-            # so the frontend WebSocket handler can match on msg.type
-            new_reading = {
-                "type":          "new_reading",   # ← was missing before
-                "node_id":       node,
-                "gateway_id":    gateway_id,
-                "timestamp":     received_at_early,  # use the earliest timestamp for real-time display
-                "temperature":   temp,
-                "humidity":      hum,
-                "flame":         flame,
-                "smoke":         smoke,
-                "latitude":      lat,
-                "longitude":     lon,
-                "rssi":          rssi,
-                "snr":           snr,
-                "ai_prediction": final_label,
-                "confidence":    f"{confidence * 100:.2f}%",
-            }
-            try:
-                requests.post(
-                    "https://flamesapp.up.railway.app/notify-new-data",
-                    json=new_reading,
-                    timeout=2
-                )
-                print(f"Notified WebSocket clients → new_reading for {node}")
-            except Exception as e:
-                print(f"Notify failed: {e}")
-
-            # ── FIX 2: incident_update — only broadcast when truly needed,
-            # not as a second redundant HTTP call for every reading.
-            final_label_lower = str(final_label).lower().strip()
-            should_broadcast_incident = (
-                (final_label_lower == "fire" and confidence >= 0.50) or
-                (final_label_lower in ("normal", "false", "no fire", "safe", "none") and confidence >= 0.70)
-            )
-
-            if should_broadcast_incident:
-                incident_update = {
-                    "type":          "incident_update",
-                    "node_id":       node,
-                    "gateway_id":    gateway_id,
-                    "ai_prediction": final_label,
-                    "confidence":    confidence,
-                    "timestamp":     received_at_early,
-                    "latitude":      lat,
-                    "longitude":     lon,
-                }
-                try:
-                    requests.post(
-                        "https://flamesapp.up.railway.app/notify-new-data",
-                        json=incident_update,
-                        timeout=2
-                    )
-                    print(f"Broadcasted incident_update for {node} ({final_label}, conf {confidence:.2f})")
-                except Exception as e:
-                    print(f"Incident notify failed: {e}")
-            else:
-                print(f"No incident broadcast needed (label='{final_label_lower}', conf={confidence:.2f})")
-
-            print(f"Inserted → gateway={gateway_id} node={node} → {final_label} ({confidence*100:.1f}%)")
-
-        except mysql.connector.Error as db_err:
-            print(f"Database error: {db_err}")
-            conn.rollback()
-        finally:
-            if 'cur' in locals():
-                cur.close()
-            conn.close()
+        print(f"Processed: Node {node} -> {final_label}")
 
     except Exception as e:
-        print("General error in on_message:", e)
+        print(f"Error in on_message: {e}")
 
-
+# --- 5. MQTT START ---
 client = mqtt.Client()
-client.username_pw_set(USER, PASS)
+client.username_pw_set(os.getenv("HIVEMQ_USER"), os.getenv("HIVEMQ_PASS"))
 client.tls_set()
-client.on_connect = on_connect
+client.on_connect = lambda c, u, f, rc: c.subscribe(TOPIC) if rc==0 else print(f"Failed: {rc}")
 client.on_message = on_message
-
-print("Starting AI-Enhanced MQTT to MySQL worker...")
-client.connect(BROKER, PORT, 60)
+client.connect(BROKER, 8883, 60)
 client.loop_forever()
