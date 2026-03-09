@@ -672,6 +672,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "status":         inc_status,
             "status_class":   status_class,
             "temperature":    row["temperature"],
+            "humidity":       row["humidity"],
             "smoke":          row["smoke"],
             "flame":          row["flame"],
             "timestamp":      format_local_timestamp(row["last_updated_at"]),
