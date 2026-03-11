@@ -39,6 +39,21 @@ class ConnectionManager:
 manager = ConnectionManager()
 #-------WEBSOCKET MANAGER END HERE----------------
 
+#-------SHARED TRAFFIC STATE START HERE----------------
+# In-memory traffic state shared across all devices on this server instance.
+# Survives page refresh and new tabs - everyone gets same traffic age.
+# Key: 'cards' for card ticker, or str(incident_id) for detail route.
+import json as _json
+_shared_traffic: dict = {}
+
+def _get_traffic(key: str):
+    return _shared_traffic.get(str(key))
+
+def _set_traffic(key: str, data: dict):
+    _shared_traffic[str(key)] = data
+#-------SHARED TRAFFIC STATE END HERE----------------
+
+
 #-----DATA MODELS START HERE----------------
 class UserCreate(BaseModel):
     username: str
@@ -601,6 +616,24 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
 # ══════════════════════════════════════════════════════════════
 #  INCIDENTS
 # ══════════════════════════════════════════════════════════════
+
+# Traffic state endpoints
+@app.get("/traffic-state")
+async def get_traffic_state(current_user: dict = Depends(get_current_user)):
+    """Return the server-side shared traffic state so all clients/devices stay in sync."""
+    return _shared_traffic
+
+@app.post("/traffic-state")
+async def save_traffic_state(payload: dict, current_user: dict = Depends(get_current_user)):
+    """Frontend posts latest TomTom traffic data here so all devices share same state."""
+    import time
+    for key, data in payload.items():
+        if data and isinstance(data, dict):
+            data["fetchedAt"] = int(time.time() * 1000)  # server-authoritative timestamp ms
+            _set_traffic(key, data)
+    # Broadcast to all connected clients so they update immediately
+    await manager.broadcast({"type": "traffic_update", "state": _shared_traffic})
+    return {"ok": True}
 
 @app.get("/incidents/active")
 async def get_active_incidents(current_user: dict = Depends(get_current_user)):
