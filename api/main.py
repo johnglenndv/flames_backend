@@ -85,7 +85,6 @@ class RespondIncidentBody(BaseModel):
 #-----DATA MODELS END HERE----------------
 
 
-<<<<<<< HEAD
 # ── DB helpers for persistent traffic cache ───────────────────────────────────
 def _db_save_traffic(avg_speed: float, avg_jam: float, timestamp_ms: int):
     """Persist latest TomTom result to traffic_cache table."""
@@ -200,9 +199,6 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 app = FastAPI(title="FLAMES API", lifespan=lifespan)
-=======
-app = FastAPI(title="FLAMES API")
->>>>>>> 6930ef439f7985a5ca35a54105b544db63084adc
 
 app.add_middleware(
     CORSMiddleware,
