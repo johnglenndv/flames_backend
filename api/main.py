@@ -85,19 +85,72 @@ class ResolveIncidentBody(BaseModel):
 class RespondIncidentBody(BaseModel):
     organization_id: int | None = None
     organization_name: str | None = None
-    
-class TrafficFetchUpdate(BaseModel):
-    timestamp_ms: int  # Unix milliseconds
 
 #-----DATA MODELS END HERE----------------
 
-
-# TomTom cache
-TOMTOM_KEY = os.getenv("TOMTOM_KEY", "iy3ljq06nVjJYIdgJdqJZAHiDaYPattE")
+# TomTom cache = os.getenv("TOMTOM_KEY", "iy3ljq06nVjJYIdgJdqJZAHiDaYPattE")
 TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json"
-TOMTOM_INTERVAL = 300_000
+TOMTOM_INTERVAL = 300
 _traffic_cache: dict = {"data": None, "timestamp": None, "failed_at": None}
 _traffic_gateway: dict = {"lat": None, "lng": None}
+
+# ── DB helpers for persistent traffic cache ───────────────────────────────────
+def _db_save_traffic(avg_speed: float, avg_jam: float, timestamp_ms: int):
+    """Persist latest TomTom result to traffic_cache table."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO traffic_cache (id, avg_speed, avg_jam, timestamp_ms, fetched_at)
+            VALUES (1, %s, %s, %s, NOW())
+            ON DUPLICATE KEY UPDATE
+                avg_speed    = VALUES(avg_speed),
+                avg_jam      = VALUES(avg_jam),
+                timestamp_ms = VALUES(timestamp_ms),
+                fetched_at   = VALUES(fetched_at)
+        """, (avg_speed, avg_jam, timestamp_ms))
+        conn.commit()
+        cur.close(); conn.close()
+    except Exception as e:
+        print(f"[FLAMES] Failed to save traffic to DB: {e}")
+
+def _db_load_traffic():
+    """Load last TomTom result from DB into memory on startup."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT avg_speed, avg_jam, timestamp_ms FROM traffic_cache WHERE id = 1")
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row and row["timestamp_ms"]:
+            _traffic_cache["data"] = {"avgJam": row["avg_jam"], "avgSpeed": row["avg_speed"]}
+            _traffic_cache["timestamp"] = row["timestamp_ms"]
+            print(f"[FLAMES] Traffic cache restored from DB — speed={row['avg_speed']} km/h ts={row['timestamp_ms']}")
+        else:
+            print("[FLAMES] No traffic cache in DB yet")
+    except Exception as e:
+        print(f"[FLAMES] Failed to load traffic from DB: {e}")
+
+def _db_load_gateway_coords():
+    """Seed _traffic_gateway from DB on startup so TomTom works after a server restart."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT latitude, longitude FROM gateways
+            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row:
+            _traffic_gateway["lat"] = row["latitude"]
+            _traffic_gateway["lng"] = row["longitude"]
+            print(f"[FLAMES] Gateway coords seeded from DB: {row['latitude']}, {row['longitude']}")
+        else:
+            print("[FLAMES] No gateway coords in DB yet — TomTom waits until a client sets them")
+    except Exception as e:
+        print(f"[FLAMES] Failed to seed gateway coords: {e}")
 
 async def _fetch_tomtom_point(client: httpx.AsyncClient, lat: float, lng: float):
     try:
@@ -132,6 +185,8 @@ async def _tomtom_background_task():
                         _traffic_cache["data"] = {"avgJam": avg_jam, "avgSpeed": avg_speed, "segments": valid}
                         _traffic_cache["timestamp"] = now_ms
                         _traffic_cache["failed_at"] = None
+                        # Persist to DB so all devices/accounts stay in sync and survives restarts
+                        _db_save_traffic(avg_speed, avg_jam, now_ms)
                         print(f"[FLAMES] TomTom fetch OK — speed={avg_speed} km/h jam={avg_jam:.2f}")
                         await manager.broadcast({"type": "traffic_update", "data": {"avgJam": avg_jam, "avgSpeed": avg_speed}, "timestamp": now_ms})
                     else:
@@ -144,30 +199,10 @@ async def _tomtom_background_task():
             print("[FLAMES] TomTom skipped — no gateway coords set")
         await asyncio.sleep(TOMTOM_INTERVAL)
 
-def _load_gateway_coords_from_db():
-    """Seed _traffic_gateway from DB on startup so TomTom works after a server restart."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor(dictionary=True)
-        cur.execute("""
-            SELECT latitude, longitude FROM gateways
-            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            _traffic_gateway["lat"] = row["latitude"]
-            _traffic_gateway["lng"] = row["longitude"]
-            print(f"[FLAMES] Gateway coords seeded from DB: {row['latitude']}, {row['longitude']}")
-        else:
-            print("[FLAMES] No gateway coords in DB yet — TomTom waits until a client sets them")
-    except Exception as e:
-        print(f"[FLAMES] Failed to seed gateway coords: {e}")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _load_gateway_coords_from_db()
+    _db_load_gateway_coords()
+    _db_load_traffic()
     task = asyncio.create_task(_tomtom_background_task())
     yield
     task.cancel()
@@ -627,29 +662,6 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_name": full_user["organization_name"] or "—",
     }
     
-@app.get("/me/traffic-fetch")
-async def get_traffic_fetch(current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT last_traffic_fetch FROM users WHERE id = %s", (current_user['id'],))
-    row = cur.fetchone()
-    cur.close(); conn.close()
-    return {"timestamp_ms": row['last_traffic_fetch'] or 0}
-
-@app.patch("/me/traffic-fetch")
-async def update_traffic_fetch(
-    body: TrafficFetchUpdate,
-    current_user: dict = Depends(get_current_user)
-):
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET last_traffic_fetch = %s WHERE id = %s",
-        (body.timestamp_ms, current_user['id'])
-    )
-    conn.commit()
-    cur.close(); conn.close()
-    return {"ok": True}
 #-----API ENDPOINTS END HERE----------------
 
 #---DELETION----
