@@ -16,6 +16,8 @@ import secrets, string
 from typing import List, Optional
 
 #-------WEBSOCKET MANAGER START HERE----------------
+import asyncio
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -25,14 +27,36 @@ class ConnectionManager:
         self.active_connections.append(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
+        dead = []
         for connection in self.active_connections:
-            await connection.send_json(message)
+            try:
+                await connection.send_json(message)
+            except Exception:
+                dead.append(connection)
+        for connection in dead:
+            self.disconnect(connection)
 
 manager = ConnectionManager()
 #-------WEBSOCKET MANAGER END HERE----------------
+
+#-------SHARED TRAFFIC STATE START HERE----------------
+# In-memory traffic state shared across all devices on this server instance.
+# Survives page refresh and new tabs - everyone gets same traffic age.
+# Key: 'cards' for card ticker, or str(incident_id) for detail route.
+import json as _json
+_shared_traffic: dict = {}
+
+def _get_traffic(key: str):
+    return _shared_traffic.get(str(key))
+
+def _set_traffic(key: str, data: dict):
+    _shared_traffic[str(key)] = data
+#-------SHARED TRAFFIC STATE END HERE----------------
+
 
 #-----DATA MODELS START HERE----------------
 class UserCreate(BaseModel):
@@ -392,8 +416,18 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_json({"type": "traffic_update", "data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]})
     try:
         while True:
-            data = await websocket.receive_text()
+            try:
+                # Wait for client message with 30s timeout, then send ping to keep alive
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Send ping to keep Railway proxy from killing idle connection
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    break
     except WebSocketDisconnect:
+        pass
+    finally:
         manager.disconnect(websocket)
 #----WEBSOCKET ENDPOINTS END HERE----------------
 
@@ -724,6 +758,24 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
 # ══════════════════════════════════════════════════════════════
 #  INCIDENTS
 # ══════════════════════════════════════════════════════════════
+
+# Traffic state endpoints
+@app.get("/traffic-state")
+async def get_traffic_state(current_user: dict = Depends(get_current_user)):
+    """Return the server-side shared traffic state so all clients/devices stay in sync."""
+    return _shared_traffic
+
+@app.post("/traffic-state")
+async def save_traffic_state(payload: dict, current_user: dict = Depends(get_current_user)):
+    """Frontend posts latest TomTom traffic data here so all devices share same state."""
+    import time
+    for key, data in payload.items():
+        if data and isinstance(data, dict):
+            data["fetchedAt"] = int(time.time() * 1000)  # server-authoritative timestamp ms
+            _set_traffic(key, data)
+    # Broadcast to all connected clients so they update immediately
+    await manager.broadcast({"type": "traffic_update", "state": _shared_traffic})
+    return {"ok": True}
 
 @app.get("/incidents/active")
 async def get_active_incidents(current_user: dict = Depends(get_current_user)):
