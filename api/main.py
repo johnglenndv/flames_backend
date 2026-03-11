@@ -1,9 +1,13 @@
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from pydantic import BaseModel, EmailStr
 import mysql.connector
 import os
+import asyncio
+import httpx
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
@@ -84,6 +88,11 @@ class RespondIncidentBody(BaseModel):
 
 #-----DATA MODELS END HERE----------------
 
+# TomTom cache = os.getenv("TOMTOM_KEY", "iy3ljq06nVjJYIdgJdqJZAHiDaYPattE")
+TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json"
+TOMTOM_INTERVAL = 300_000
+_traffic_cache: dict = {"data": None, "timestamp": None, "failed_at": None}
+_traffic_gateway: dict = {"lat": None, "lng": None}
 
 # ── DB helpers for persistent traffic cache ───────────────────────────────────
 def _db_save_traffic(avg_speed: float, avg_jam: float, timestamp_ms: int):
@@ -359,9 +368,26 @@ def upsert_fire_incident(cur, reading: dict):
         ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
+@app.get("/traffic/latest")
+async def get_latest_traffic(current_user: dict = Depends(get_current_user)):
+    return {"data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]}
+
+class GatewayCoords(BaseModel):
+    lat: float
+    lng: float
+
+@app.post("/traffic/gateway")
+async def set_traffic_gateway(coords: GatewayCoords, current_user: dict = Depends(get_current_user)):
+    _traffic_gateway["lat"] = coords.lat
+    _traffic_gateway["lng"] = coords.lng
+    print(f"[FLAMES] TomTom gateway set to: {coords.lat}, {coords.lng}")
+    return {"ok": True}
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    if _traffic_cache["timestamp"] is not None:
+        await websocket.send_json({"type": "traffic_update", "data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]})
     try:
         while True:
             data = await websocket.receive_text()
@@ -635,6 +661,7 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_id":   full_user["org_id"],
         "organization_name": full_user["organization_name"] or "—",
     }
+    
 #-----API ENDPOINTS END HERE----------------
 
 #---DELETION----
