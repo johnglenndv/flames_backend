@@ -307,38 +307,6 @@ def upsert_fire_incident(cur, reading: dict):
         ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
-_tile_cache: dict = {}
-TILE_CACHE_TTL = 300
-TILE_CACHE_MAX = 2000
-
-@app.get("/traffic/tile/{z}/{x}/{y}")
-async def proxy_traffic_tile(z: int, x: int, y: int):
-    from fastapi.responses import Response
-    key = (z, x, y)
-    now = time.time()
-    cached = _tile_cache.get(key)
-    if cached and (now - cached["fetched_at"]) < TILE_CACHE_TTL:
-        return Response(content=cached["bytes"], media_type=cached["content_type"],
-                        headers={"X-Cache": "HIT", "Cache-Control": f"max-age={TILE_CACHE_TTL}"})
-    url = f"https://api.tomtom.com/traffic/map/4/tile/flow/relative0/{z}/{x}/{y}.png?key={TOMTOM_KEY}&tileSize=256&style=2"
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, timeout=8.0)
-            if not r.is_success:
-                raise HTTPException(status_code=r.status_code, detail="Tile fetch failed")
-            tile_bytes = r.content
-            ctype = r.headers.get("content-type", "image/png")
-            if len(_tile_cache) >= TILE_CACHE_MAX:
-                oldest = min(_tile_cache, key=lambda k: _tile_cache[k]["fetched_at"])
-                del _tile_cache[oldest]
-            _tile_cache[key] = {"bytes": tile_bytes, "content_type": ctype, "fetched_at": now}
-            return Response(content=tile_bytes, media_type=ctype,
-                            headers={"X-Cache": "MISS", "Cache-Control": f"max-age={TILE_CACHE_TTL}"})
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Tile proxy error: {e}")
-
 @app.get("/traffic/latest")
 async def get_latest_traffic(current_user: dict = Depends(get_current_user)):
     return {"data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]}
