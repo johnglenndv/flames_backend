@@ -1,9 +1,13 @@
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from pydantic import BaseModel, EmailStr
 import mysql.connector
 import os
+import asyncio
+import httpx
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
@@ -84,8 +88,15 @@ class RespondIncidentBody(BaseModel):
 
 #-----DATA MODELS END HERE----------------
 
+# TomTom config
+# FIX 1: was "# TomTom cache = os.getenv(...)" — the # made it a comment so TOMTOM_KEY was never defined,
+#         causing a silent NameError in every _fetch_tomtom_point call → all 10 segments failed
+TOMTOM_KEY = os.getenv("TOMTOM_KEY", "iy3ljq06nVjJYIdgJdqJZAHiDaYPattE")
+TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json"
+TOMTOM_INTERVAL = 300  # FIX 2: was 300_000 — asyncio.sleep() takes seconds, not ms (300_000s = ~83 hours!)
+_traffic_cache: dict = {"data": None, "timestamp": None, "failed_at": None}
+_traffic_gateway: dict = {"lat": None, "lng": None}
 
-<<<<<<< HEAD
 # ── DB helpers for persistent traffic cache ───────────────────────────────────
 def _db_save_traffic(avg_speed: float, avg_jam: float, timestamp_ms: int):
     """Persist latest TomTom result to traffic_cache table."""
@@ -148,7 +159,6 @@ async def _fetch_tomtom_point(client: httpx.AsyncClient, lat: float, lng: float)
     try:
         url = f"{TOMTOM_FLOW_BASE}?point={lat},{lng}&unit=KMPH&openLr=false&key={TOMTOM_KEY}"
         r = await client.get(url, timeout=8.0)
-        print(f"[FLAMES DEBUG] TomTom {lat:.4f},{lng:.4f} → HTTP {r.status_code} | body={r.text[:200]}")
         if not r.is_success:
             return None
         j = r.json()
@@ -178,7 +188,6 @@ async def _tomtom_background_task():
                         _traffic_cache["data"] = {"avgJam": avg_jam, "avgSpeed": avg_speed, "segments": valid}
                         _traffic_cache["timestamp"] = now_ms
                         _traffic_cache["failed_at"] = None
-                        # Persist to DB so all devices/accounts stay in sync and survives restarts
                         _db_save_traffic(avg_speed, avg_jam, now_ms)
                         print(f"[FLAMES] TomTom fetch OK — speed={avg_speed} km/h jam={avg_jam:.2f}")
                         await manager.broadcast({"type": "traffic_update", "data": {"avgJam": avg_jam, "avgSpeed": avg_speed}, "timestamp": now_ms})
@@ -201,9 +210,6 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 app = FastAPI(title="FLAMES API", lifespan=lifespan)
-=======
-app = FastAPI(title="FLAMES API")
->>>>>>> 6930ef439f7985a5ca35a54105b544db63084adc
 
 app.add_middleware(
     CORSMiddleware,
@@ -364,9 +370,26 @@ def upsert_fire_incident(cur, reading: dict):
         ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
+@app.get("/traffic/latest")
+async def get_latest_traffic(current_user: dict = Depends(get_current_user)):
+    return {"data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]}
+
+class GatewayCoords(BaseModel):
+    lat: float
+    lng: float
+
+@app.post("/traffic/gateway")
+async def set_traffic_gateway(coords: GatewayCoords, current_user: dict = Depends(get_current_user)):
+    _traffic_gateway["lat"] = coords.lat
+    _traffic_gateway["lng"] = coords.lng
+    print(f"[FLAMES] TomTom gateway set to: {coords.lat}, {coords.lng}")
+    return {"ok": True}
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
+    if _traffic_cache["timestamp"] is not None:
+        await websocket.send_json({"type": "traffic_update", "data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]})
     try:
         while True:
             data = await websocket.receive_text()
@@ -640,6 +663,7 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_id":   full_user["org_id"],
         "organization_name": full_user["organization_name"] or "—",
     }
+
 #-----API ENDPOINTS END HERE----------------
 
 #---DELETION----
@@ -936,7 +960,6 @@ async def get_incident_by_id(
 
     confidence_val = float(row["confidence"]) if row.get("confidence") is not None else 0.0
     confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
-    pred = (row.get("ai_prediction") or "").lower()
 
     return {
         "incident_id":    row["id"],
@@ -986,7 +1009,6 @@ async def respond_to_incident(
     node_id = inc["node_id"]
     cur.close(); conn.close()
 
-    # Broadcast to all connected clients so they update immediately
     await manager.broadcast({
         "type":        "incident_update",
         "incident_id": incident_id,
@@ -1032,15 +1054,12 @@ async def resolve_incident(
     conn.commit()
     cur.close(); conn.close()
 
-    # Broadcast incident resolved — includes node_id and action so all clients
-    # can immediately remove the fire animation without waiting for the poll cycle
     await manager.broadcast({
         "type":        "incident_update",
         "incident_id": incident_id,
         "action":      "resolved",
         "node_id":     node_id,
     })
-    # Also broadcast a node_update so loadAndPlaceNodes() fires on all clients
     await manager.broadcast({
         "type":    "node_update",
         "node_id": node_id,
@@ -1309,7 +1328,6 @@ async def simulate_fire(
     conn.commit()
     cur.close(); conn.close()
 
-    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
@@ -1380,7 +1398,6 @@ async def simulate_false(
     conn.commit()
     cur.close(); conn.close()
 
-    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
@@ -1444,7 +1461,6 @@ async def simulate_normal(
     conn.commit()
     cur.close(); conn.close()
 
-    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
