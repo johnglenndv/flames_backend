@@ -1,3 +1,4 @@
+<<<<<<< Updated upstream
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -1546,3 +1547,5 @@ if __name__ == "__main__":
         proxy_headers=True,
         forwarded_allow_ips="*"
     )
+=======
+>>>>>>> Stashed changes
