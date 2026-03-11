@@ -522,34 +522,6 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_id":   full_user["org_id"],
         "organization_name": full_user["organization_name"] or "—",
     }
-    
-    
-class TrafficFetchUpdate(BaseModel):
-    timestamp_ms: int  # Unix milliseconds
-
-@app.get("/me/traffic-fetch")
-async def get_traffic_fetch(current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cur = conn.cursor(dictionary=True)
-    cur.execute("SELECT last_traffic_fetch FROM users WHERE id = %s", (current_user['id'],))
-    row = cur.fetchone()
-    cur.close(); conn.close()
-    return {"timestamp_ms": row['last_traffic_fetch'] or 0}
-
-@app.patch("/me/traffic-fetch")
-async def update_traffic_fetch(
-    body: TrafficFetchUpdate,
-    current_user: dict = Depends(get_current_user)
-):
-    conn = mysql.connector.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET last_traffic_fetch = %s WHERE id = %s",
-        (body.timestamp_ms, current_user['id'])
-    )
-    conn.commit()
-    cur.close(); conn.close()
-    return {"ok": True}
 #-----API ENDPOINTS END HERE----------------
 
 #---DELETION----
