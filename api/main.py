@@ -144,9 +144,9 @@ def _db_load_gateway_coords():
         row = cur.fetchone()
         cur.close(); conn.close()
         if row:
-            _traffic_gateway["lat"] = row["latitude"]
-            _traffic_gateway["lng"] = row["longitude"]
-            print(f"[FLAMES] Gateway coords seeded from DB: {row['latitude']}, {row['longitude']}")
+            _traffic_gateway["lat"] = float(row["latitude"])
+            _traffic_gateway["lng"] = float(row["longitude"])
+            print(f"[FLAMES] Gateway coords seeded from DB: {_traffic_gateway['lat']}, {_traffic_gateway['lng']}")
         else:
             print("[FLAMES] No gateway coords in DB yet — TomTom waits until a client sets them")
     except Exception as e:
