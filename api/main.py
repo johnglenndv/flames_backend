@@ -1,13 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 from pydantic import BaseModel, EmailStr
 import mysql.connector
 import os
-import asyncio
-import httpx
-import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
@@ -88,126 +84,8 @@ class RespondIncidentBody(BaseModel):
 
 #-----DATA MODELS END HERE----------------
 
-# TomTom cache = os.getenv("TOMTOM_KEY", "iy3ljq06nVjJYIdgJdqJZAHiDaYPattE")
-TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json"
-TOMTOM_INTERVAL = 300_000
-_traffic_cache: dict = {"data": None, "timestamp": None, "failed_at": None}
-_traffic_gateway: dict = {"lat": None, "lng": None}
 
-# ── DB helpers for persistent traffic cache ───────────────────────────────────
-def _db_save_traffic(avg_speed: float, avg_jam: float, timestamp_ms: int):
-    """Persist latest TomTom result to traffic_cache table."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO traffic_cache (id, avg_speed, avg_jam, timestamp_ms, fetched_at)
-            VALUES (1, %s, %s, %s, NOW())
-            ON DUPLICATE KEY UPDATE
-                avg_speed    = VALUES(avg_speed),
-                avg_jam      = VALUES(avg_jam),
-                timestamp_ms = VALUES(timestamp_ms),
-                fetched_at   = VALUES(fetched_at)
-        """, (avg_speed, avg_jam, timestamp_ms))
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        print(f"[FLAMES] Failed to save traffic to DB: {e}")
-
-def _db_load_traffic():
-    """Load last TomTom result from DB into memory on startup."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT avg_speed, avg_jam, timestamp_ms FROM traffic_cache WHERE id = 1")
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row and row["timestamp_ms"]:
-            _traffic_cache["data"] = {"avgJam": row["avg_jam"], "avgSpeed": row["avg_speed"]}
-            _traffic_cache["timestamp"] = row["timestamp_ms"]
-            print(f"[FLAMES] Traffic cache restored from DB — speed={row['avg_speed']} km/h ts={row['timestamp_ms']}")
-        else:
-            print("[FLAMES] No traffic cache in DB yet")
-    except Exception as e:
-        print(f"[FLAMES] Failed to load traffic from DB: {e}")
-
-def _db_load_gateway_coords():
-    """Seed _traffic_gateway from DB on startup so TomTom works after a server restart."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor(dictionary=True)
-        cur.execute("""
-            SELECT latitude, longitude FROM gateways
-            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            _traffic_gateway["lat"] = float(row["latitude"])
-            _traffic_gateway["lng"] = float(row["longitude"])
-            print(f"[FLAMES] Gateway coords seeded from DB: {_traffic_gateway['lat']}, {_traffic_gateway['lng']}")
-        else:
-            print("[FLAMES] No gateway coords in DB yet — TomTom waits until a client sets them")
-    except Exception as e:
-        print(f"[FLAMES] Failed to seed gateway coords: {e}")
-
-async def _fetch_tomtom_point(client: httpx.AsyncClient, lat: float, lng: float):
-    try:
-        url = f"{TOMTOM_FLOW_BASE}?point={lat},{lng}&unit=KMPH&openLr=false&key={TOMTOM_KEY}"
-        r = await client.get(url, timeout=8.0)
-        if not r.is_success:
-            return None
-        j = r.json()
-        fd = j["flowSegmentData"]
-        cs = fd["currentSpeed"]
-        ff = fd["freeFlowSpeed"]
-        jam = max(0.0, min(10.0, (1 - cs / ff) * 10)) if ff > 0 else 0.0
-        return {"currentSpeed": cs, "freeFlowSpeed": ff, "jamFactor": jam, "confidence": fd.get("confidence", 1)}
-    except Exception:
-        return None
-
-async def _tomtom_background_task():
-    await asyncio.sleep(5)
-    while True:
-        gw = _traffic_gateway
-        if gw["lat"] is not None and gw["lng"] is not None:
-            try:
-                async with httpx.AsyncClient() as client:
-                    pts = [(gw["lat"] + (i - 4.5) * 0.002, gw["lng"]) for i in range(10)]
-                    results = await asyncio.gather(*[_fetch_tomtom_point(client, lat, lng) for lat, lng in pts], return_exceptions=True)
-                    valid = [r for r in results if isinstance(r, dict)]
-                    now_ms = int(time.time() * 1000)
-                    if valid:
-                        tc = sum(v.get("confidence", 1) for v in valid)
-                        avg_jam = sum(v["jamFactor"] * v.get("confidence", 1) for v in valid) / tc
-                        avg_speed = round(sum(v["currentSpeed"] * v.get("confidence", 1) for v in valid) / tc)
-                        _traffic_cache["data"] = {"avgJam": avg_jam, "avgSpeed": avg_speed, "segments": valid}
-                        _traffic_cache["timestamp"] = now_ms
-                        _traffic_cache["failed_at"] = None
-                        # Persist to DB so all devices/accounts stay in sync and survives restarts
-                        _db_save_traffic(avg_speed, avg_jam, now_ms)
-                        print(f"[FLAMES] TomTom fetch OK — speed={avg_speed} km/h jam={avg_jam:.2f}")
-                        await manager.broadcast({"type": "traffic_update", "data": {"avgJam": avg_jam, "avgSpeed": avg_speed}, "timestamp": now_ms})
-                    else:
-                        print(f"[FLAMES] TomTom returned no valid segments (all {len(results)} failed)")
-                        _traffic_cache["failed_at"] = now_ms
-                        await manager.broadcast({"type": "traffic_update", "data": None, "timestamp": _traffic_cache["timestamp"], "failed_at": now_ms})
-            except Exception as e:
-                print(f"[FLAMES] TomTom error: {e}")
-        else:
-            print("[FLAMES] TomTom skipped — no gateway coords set")
-        await asyncio.sleep(TOMTOM_INTERVAL)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    _db_load_gateway_coords()
-    _db_load_traffic()
-    task = asyncio.create_task(_tomtom_background_task())
-    yield
-    task.cancel()
-
-app = FastAPI(title="FLAMES API", lifespan=lifespan)
+app = FastAPI(title="FLAMES API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -368,26 +246,9 @@ def upsert_fire_incident(cur, reading: dict):
         ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
-@app.get("/traffic/latest")
-async def get_latest_traffic(current_user: dict = Depends(get_current_user)):
-    return {"data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]}
-
-class GatewayCoords(BaseModel):
-    lat: float
-    lng: float
-
-@app.post("/traffic/gateway")
-async def set_traffic_gateway(coords: GatewayCoords, current_user: dict = Depends(get_current_user)):
-    _traffic_gateway["lat"] = coords.lat
-    _traffic_gateway["lng"] = coords.lng
-    print(f"[FLAMES] TomTom gateway set to: {coords.lat}, {coords.lng}")
-    return {"ok": True}
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    if _traffic_cache["timestamp"] is not None:
-        await websocket.send_json({"type": "traffic_update", "data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]})
     try:
         while True:
             data = await websocket.receive_text()
@@ -661,7 +522,6 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_id":   full_user["org_id"],
         "organization_name": full_user["organization_name"] or "—",
     }
-    
 #-----API ENDPOINTS END HERE----------------
 
 #---DELETION----
