@@ -7,3 +7,6 @@ bcrypt==4.1.2
 python-multipart
 pydantic
 pydantic[email]
+asyncio
+httpx
+python-dotenv
