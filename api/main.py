@@ -1,13 +1,9 @@
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 from pydantic import BaseModel, EmailStr
 import mysql.connector
 import os
-import asyncio
-import httpx
-import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
@@ -89,61 +85,7 @@ class RespondIncidentBody(BaseModel):
 #-----DATA MODELS END HERE----------------
 
 
-# TomTom cache
-TOMTOM_KEY = os.getenv("TOMTOM_KEY", "lOWQDi4zApH4e7ErhUadSnRFHgYLg05X")
-TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json"
-TOMTOM_INTERVAL = 300
-_traffic_cache: dict = {"data": None, "timestamp": None, "failed_at": None}
-_traffic_gateway: dict = {"lat": None, "lng": None}
-
-async def _fetch_tomtom_point(client: httpx.AsyncClient, lat: float, lng: float):
-    try:
-        url = f"{TOMTOM_FLOW_BASE}?point={lat},{lng}&unit=KMPH&openLr=false&key={TOMTOM_KEY}"
-        r = await client.get(url, timeout=8.0)
-        if not r.is_success:
-            return None
-        j = r.json()
-        fd = j["flowSegmentData"]
-        cs = fd["currentSpeed"]
-        ff = fd["freeFlowSpeed"]
-        jam = max(0.0, min(10.0, (1 - cs / ff) * 10)) if ff > 0 else 0.0
-        return {"currentSpeed": cs, "freeFlowSpeed": ff, "jamFactor": jam, "confidence": fd.get("confidence", 1)}
-    except Exception:
-        return None
-
-async def _tomtom_background_task():
-    await asyncio.sleep(5)
-    while True:
-        gw = _traffic_gateway
-        if gw["lat"] is not None and gw["lng"] is not None:
-            try:
-                async with httpx.AsyncClient() as client:
-                    pts = [(gw["lat"] + (i - 4.5) * 0.002, gw["lng"]) for i in range(10)]
-                    results = await asyncio.gather(*[_fetch_tomtom_point(client, lat, lng) for lat, lng in pts], return_exceptions=True)
-                    valid = [r for r in results if isinstance(r, dict)]
-                    now_ms = int(time.time() * 1000)
-                    if valid:
-                        tc = sum(v.get("confidence", 1) for v in valid)
-                        avg_jam = sum(v["jamFactor"] * v.get("confidence", 1) for v in valid) / tc
-                        avg_speed = round(sum(v["currentSpeed"] * v.get("confidence", 1) for v in valid) / tc)
-                        _traffic_cache["data"] = {"avgJam": avg_jam, "avgSpeed": avg_speed, "segments": valid}
-                        _traffic_cache["timestamp"] = now_ms
-                        _traffic_cache["failed_at"] = None
-                        await manager.broadcast({"type": "traffic_update", "data": {"avgJam": avg_jam, "avgSpeed": avg_speed}, "timestamp": now_ms})
-                    else:
-                        _traffic_cache["failed_at"] = now_ms
-                        await manager.broadcast({"type": "traffic_update", "data": None, "timestamp": _traffic_cache["timestamp"], "failed_at": now_ms})
-            except Exception as e:
-                print(f"[FLAMES] TomTom error: {e}")
-        await asyncio.sleep(TOMTOM_INTERVAL)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_tomtom_background_task())
-    yield
-    task.cancel()
-
-app = FastAPI(title="FLAMES API", lifespan=lifespan)
+app = FastAPI(title="FLAMES API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -304,26 +246,9 @@ def upsert_fire_incident(cur, reading: dict):
         ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
-@app.get("/traffic/latest")
-async def get_latest_traffic(current_user: dict = Depends(get_current_user)):
-    return {"data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]}
-
-class GatewayCoords(BaseModel):
-    lat: float
-    lng: float
-
-@app.post("/traffic/gateway")
-async def set_traffic_gateway(coords: GatewayCoords, current_user: dict = Depends(get_current_user)):
-    _traffic_gateway["lat"] = coords.lat
-    _traffic_gateway["lng"] = coords.lng
-    print(f"[FLAMES] TomTom gateway set to: {coords.lat}, {coords.lng}")
-    return {"ok": True}
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    if _traffic_cache["timestamp"] is not None:
-        await websocket.send_json({"type": "traffic_update", "data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]})
     try:
         while True:
             data = await websocket.receive_text()
