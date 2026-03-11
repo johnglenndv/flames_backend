@@ -93,7 +93,7 @@ class TrafficFetchUpdate(BaseModel):
 
 
 # TomTom cache
-TOMTOM_KEY = os.getenv("TOMTOM_KEY", "nWylUeswIa1UtoVl0FZtyvz9Y5PkiYNa")
+TOMTOM_KEY = os.getenv("TOMTOM_KEY", "iy3ljq06nVjJYIdgJdqJZAHiDaYPattE")
 TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json"
 TOMTOM_INTERVAL = 300
 _traffic_cache: dict = {"data": None, "timestamp": None, "failed_at": None}
