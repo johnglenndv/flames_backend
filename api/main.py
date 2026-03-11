@@ -1,14 +1,9 @@
-<<<<<<< Updated upstream
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 from pydantic import BaseModel, EmailStr
 import mysql.connector
 import os
-import asyncio
-import httpx
-import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from jose import JWTError, jwt
@@ -113,128 +108,8 @@ class RespondIncidentBody(BaseModel):
 
 #-----DATA MODELS END HERE----------------
 
-# TomTom config
-# FIX 1: was "# TomTom cache = os.getenv(...)" — the # made it a comment so TOMTOM_KEY was never defined,
-#         causing a silent NameError in every _fetch_tomtom_point call → all 10 segments failed
-TOMTOM_KEY = os.getenv("TOMTOM_KEY", "iy3ljq06nVjJYIdgJdqJZAHiDaYPattE")
-TOMTOM_FLOW_BASE = "https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json"
-TOMTOM_INTERVAL = 300  # FIX 2: was 300_000 — asyncio.sleep() takes seconds, not ms (300_000s = ~83 hours!)
-_traffic_cache: dict = {"data": None, "timestamp": None, "failed_at": None}
-_traffic_gateway: dict = {"lat": None, "lng": None}
 
-# ── DB helpers for persistent traffic cache ───────────────────────────────────
-def _db_save_traffic(avg_speed: float, avg_jam: float, timestamp_ms: int):
-    """Persist latest TomTom result to traffic_cache table."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO traffic_cache (id, avg_speed, avg_jam, timestamp_ms, fetched_at)
-            VALUES (1, %s, %s, %s, NOW())
-            ON DUPLICATE KEY UPDATE
-                avg_speed    = VALUES(avg_speed),
-                avg_jam      = VALUES(avg_jam),
-                timestamp_ms = VALUES(timestamp_ms),
-                fetched_at   = VALUES(fetched_at)
-        """, (avg_speed, avg_jam, timestamp_ms))
-        conn.commit()
-        cur.close(); conn.close()
-    except Exception as e:
-        print(f"[FLAMES] Failed to save traffic to DB: {e}")
-
-def _db_load_traffic():
-    """Load last TomTom result from DB into memory on startup."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor(dictionary=True)
-        cur.execute("SELECT avg_speed, avg_jam, timestamp_ms FROM traffic_cache WHERE id = 1")
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row and row["timestamp_ms"]:
-            _traffic_cache["data"] = {"avgJam": row["avg_jam"], "avgSpeed": row["avg_speed"]}
-            _traffic_cache["timestamp"] = row["timestamp_ms"]
-            print(f"[FLAMES] Traffic cache restored from DB — speed={row['avg_speed']} km/h ts={row['timestamp_ms']}")
-        else:
-            print("[FLAMES] No traffic cache in DB yet")
-    except Exception as e:
-        print(f"[FLAMES] Failed to load traffic from DB: {e}")
-
-def _db_load_gateway_coords():
-    """Seed _traffic_gateway from DB on startup so TomTom works after a server restart."""
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        cur = conn.cursor(dictionary=True)
-        cur.execute("""
-            SELECT latitude, longitude FROM gateways
-            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-            LIMIT 1
-        """)
-        row = cur.fetchone()
-        cur.close(); conn.close()
-        if row:
-            _traffic_gateway["lat"] = float(row["latitude"])
-            _traffic_gateway["lng"] = float(row["longitude"])
-            print(f"[FLAMES] Gateway coords seeded from DB: {_traffic_gateway['lat']}, {_traffic_gateway['lng']}")
-        else:
-            print("[FLAMES] No gateway coords in DB yet — TomTom waits until a client sets them")
-    except Exception as e:
-        print(f"[FLAMES] Failed to seed gateway coords: {e}")
-
-async def _fetch_tomtom_point(client: httpx.AsyncClient, lat: float, lng: float):
-    try:
-        url = f"{TOMTOM_FLOW_BASE}?point={lat},{lng}&unit=KMPH&openLr=false&key={TOMTOM_KEY}"
-        r = await client.get(url, timeout=8.0)
-        if not r.is_success:
-            return None
-        j = r.json()
-        fd = j["flowSegmentData"]
-        cs = fd["currentSpeed"]
-        ff = fd["freeFlowSpeed"]
-        jam = max(0.0, min(10.0, (1 - cs / ff) * 10)) if ff > 0 else 0.0
-        return {"currentSpeed": cs, "freeFlowSpeed": ff, "jamFactor": jam, "confidence": fd.get("confidence", 1)}
-    except Exception:
-        return None
-
-async def _tomtom_background_task():
-    await asyncio.sleep(5)
-    while True:
-        gw = _traffic_gateway
-        if gw["lat"] is not None and gw["lng"] is not None:
-            try:
-                async with httpx.AsyncClient() as client:
-                    pts = [(gw["lat"] + (i - 4.5) * 0.002, gw["lng"]) for i in range(10)]
-                    results = await asyncio.gather(*[_fetch_tomtom_point(client, lat, lng) for lat, lng in pts], return_exceptions=True)
-                    valid = [r for r in results if isinstance(r, dict)]
-                    now_ms = int(time.time() * 1000)
-                    if valid:
-                        tc = sum(v.get("confidence", 1) for v in valid)
-                        avg_jam = sum(v["jamFactor"] * v.get("confidence", 1) for v in valid) / tc
-                        avg_speed = round(sum(v["currentSpeed"] * v.get("confidence", 1) for v in valid) / tc)
-                        _traffic_cache["data"] = {"avgJam": avg_jam, "avgSpeed": avg_speed, "segments": valid}
-                        _traffic_cache["timestamp"] = now_ms
-                        _traffic_cache["failed_at"] = None
-                        _db_save_traffic(avg_speed, avg_jam, now_ms)
-                        print(f"[FLAMES] TomTom fetch OK — speed={avg_speed} km/h jam={avg_jam:.2f}")
-                        await manager.broadcast({"type": "traffic_update", "data": {"avgJam": avg_jam, "avgSpeed": avg_speed}, "timestamp": now_ms})
-                    else:
-                        print(f"[FLAMES] TomTom returned no valid segments (all {len(results)} failed)")
-                        _traffic_cache["failed_at"] = now_ms
-                        await manager.broadcast({"type": "traffic_update", "data": None, "timestamp": _traffic_cache["timestamp"], "failed_at": now_ms})
-            except Exception as e:
-                print(f"[FLAMES] TomTom error: {e}")
-        else:
-            print("[FLAMES] TomTom skipped — no gateway coords set")
-        await asyncio.sleep(TOMTOM_INTERVAL)
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    _db_load_gateway_coords()
-    _db_load_traffic()
-    task = asyncio.create_task(_tomtom_background_task())
-    yield
-    task.cancel()
-
-app = FastAPI(title="FLAMES API", lifespan=lifespan)
+app = FastAPI(title="FLAMES API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -282,6 +157,23 @@ def format_local_timestamp(ts):
     except Exception as e:
         print(f"format_local_timestamp error: {e}")
         return str(ts)
+
+def ph_local_to_utc_iso(ts):
+    """Convert a PH-local (UTC+8) datetime (naive or string) to a proper UTC ISO string.
+    The DB stores started_at in PH local time. This converts it back to real UTC
+    so all clients compute consistent relative ages regardless of their own timezone."""
+    if not ts:
+        return None
+    try:
+        if isinstance(ts, str):
+            from datetime import datetime as _dt
+            ts = _dt.strptime(ts.replace('T', ' ').split('.')[0][:19], "%Y-%m-%d %H:%M:%S")
+        # ts is naive but represents PH time (UTC+8), so UTC = ts - 8h
+        utc_dt = ts - timedelta(hours=8)
+        return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception as e:
+        print(f"ph_local_to_utc_iso error: {e}")
+        return None
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -395,26 +287,9 @@ def upsert_fire_incident(cur, reading: dict):
         ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
-@app.get("/traffic/latest")
-async def get_latest_traffic(current_user: dict = Depends(get_current_user)):
-    return {"data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]}
-
-class GatewayCoords(BaseModel):
-    lat: float
-    lng: float
-
-@app.post("/traffic/gateway")
-async def set_traffic_gateway(coords: GatewayCoords, current_user: dict = Depends(get_current_user)):
-    _traffic_gateway["lat"] = coords.lat
-    _traffic_gateway["lng"] = coords.lng
-    print(f"[FLAMES] TomTom gateway set to: {coords.lat}, {coords.lng}")
-    return {"ok": True}
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    if _traffic_cache["timestamp"] is not None:
-        await websocket.send_json({"type": "traffic_update", "data": _traffic_cache["data"], "timestamp": _traffic_cache["timestamp"], "failed_at": _traffic_cache["failed_at"]})
     try:
         while True:
             try:
@@ -698,7 +573,6 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_id":   full_user["org_id"],
         "organization_name": full_user["organization_name"] or "—",
     }
-
 #-----API ENDPOINTS END HERE----------------
 
 #---DELETION----
@@ -872,6 +746,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "flame":          row["flame"],
             "timestamp":      format_local_timestamp(row["last_updated_at"]),
             "started_at":     format_local_timestamp(row["started_at"]),
+            "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
             "assigned_team":  row["assigned_team"],
         })
     return incidents
@@ -984,6 +859,7 @@ async def get_resolved_incidents(
             "notes":          row.get("notes"),
             "timestamp":      format_local_timestamp(row.get("last_updated_at")),
             "started_at":     format_local_timestamp(row.get("started_at")),
+            "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
             "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
             "assigned_team":  row.get("assigned_team"),
         })
@@ -1013,6 +889,7 @@ async def get_incident_by_id(
 
     confidence_val = float(row["confidence"]) if row.get("confidence") is not None else 0.0
     confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
+    pred = (row.get("ai_prediction") or "").lower()
 
     return {
         "incident_id":    row["id"],
@@ -1033,6 +910,7 @@ async def get_incident_by_id(
         "assigned_team":  row.get("assigned_team"),
         "timestamp":      format_local_timestamp(row.get("last_updated_at")),
         "started_at":     format_local_timestamp(row.get("started_at")),
+        "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
         "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
     }
 
@@ -1062,6 +940,7 @@ async def respond_to_incident(
     node_id = inc["node_id"]
     cur.close(); conn.close()
 
+    # Broadcast to all connected clients so they update immediately
     await manager.broadcast({
         "type":        "incident_update",
         "incident_id": incident_id,
@@ -1107,12 +986,15 @@ async def resolve_incident(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast incident resolved — includes node_id and action so all clients
+    # can immediately remove the fire animation without waiting for the poll cycle
     await manager.broadcast({
         "type":        "incident_update",
         "incident_id": incident_id,
         "action":      "resolved",
         "node_id":     node_id,
     })
+    # Also broadcast a node_update so loadAndPlaceNodes() fires on all clients
     await manager.broadcast({
         "type":    "node_update",
         "node_id": node_id,
@@ -1381,6 +1263,7 @@ async def simulate_fire(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
@@ -1451,6 +1334,7 @@ async def simulate_false(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
@@ -1514,6 +1398,7 @@ async def simulate_normal(
     conn.commit()
     cur.close(); conn.close()
 
+    # Broadcast both incident_update AND node_update so all clients react immediately
     await manager.broadcast({
         "type":          "incident_update",
         "node_id":       node_id,
@@ -1547,5 +1432,3 @@ if __name__ == "__main__":
         proxy_headers=True,
         forwarded_allow_ips="*"
     )
-=======
->>>>>>> Stashed changes
