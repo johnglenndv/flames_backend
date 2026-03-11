@@ -132,16 +132,42 @@ async def _tomtom_background_task():
                         _traffic_cache["data"] = {"avgJam": avg_jam, "avgSpeed": avg_speed, "segments": valid}
                         _traffic_cache["timestamp"] = now_ms
                         _traffic_cache["failed_at"] = None
+                        print(f"[FLAMES] TomTom fetch OK — speed={avg_speed} km/h jam={avg_jam:.2f}")
                         await manager.broadcast({"type": "traffic_update", "data": {"avgJam": avg_jam, "avgSpeed": avg_speed}, "timestamp": now_ms})
                     else:
+                        print(f"[FLAMES] TomTom returned no valid segments (all {len(results)} failed)")
                         _traffic_cache["failed_at"] = now_ms
                         await manager.broadcast({"type": "traffic_update", "data": None, "timestamp": _traffic_cache["timestamp"], "failed_at": now_ms})
             except Exception as e:
                 print(f"[FLAMES] TomTom error: {e}")
+        else:
+            print("[FLAMES] TomTom skipped — no gateway coords set")
         await asyncio.sleep(TOMTOM_INTERVAL)
+
+def _load_gateway_coords_from_db():
+    """Seed _traffic_gateway from DB on startup so TomTom works after a server restart."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        cur = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT latitude, longitude FROM gateways
+            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row:
+            _traffic_gateway["lat"] = row["latitude"]
+            _traffic_gateway["lng"] = row["longitude"]
+            print(f"[FLAMES] Gateway coords seeded from DB: {row['latitude']}, {row['longitude']}")
+        else:
+            print("[FLAMES] No gateway coords in DB yet — TomTom waits until a client sets them")
+    except Exception as e:
+        print(f"[FLAMES] Failed to seed gateway coords: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_gateway_coords_from_db()
     task = asyncio.create_task(_tomtom_background_task())
     yield
     task.cancel()
