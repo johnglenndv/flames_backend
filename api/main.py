@@ -718,6 +718,20 @@ async def save_traffic_state(payload: dict, current_user: dict = Depends(get_cur
     await manager.broadcast({"type": "traffic_update", "state": _shared_traffic})
     return {"ok": True}
 
+@app.post("/api/traffic-flow")
+async def proxy_traffic_flow(payload: dict, current_user: dict = Depends(get_current_user)):
+    """Proxy TomTom flow API — keeps API key hidden from browser source code."""
+    coords = payload.get("coords", [])
+    if not coords:
+        return {"traffic": None}
+    traffic = await _server_fetch_traffic(coords)
+    return {"traffic": traffic}
+
+@app.get("/api/tomtom-tile-key")
+async def get_tomtom_tile_key(current_user: dict = Depends(get_current_user)):
+    """Return TomTom tile key so frontend can build tile URL without hardcoding the key."""
+    return {"key": TOMTOM_KEY}
+
 @app.get("/incidents/active")
 async def get_active_incidents(current_user: dict = Depends(get_current_user)):
     conn = mysql.connector.connect(**DB_CONFIG)
