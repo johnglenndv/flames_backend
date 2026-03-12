@@ -53,6 +53,72 @@ def _set_traffic(key: str, data: dict):
     _shared_traffic[str(key)] = data
 #-------SHARED TRAFFIC STATE END HERE----------------
 
+#-------TOMTOM BACKGROUND TASK START HERE----------------
+import httpx as _httpx
+from contextlib import asynccontextmanager
+
+TOMTOM_KEY       = 'iy3ljq06nVjJYIdgJdqJZAHiDaYPattE'
+TOMTOM_FLOW_BASE = 'https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json'
+TRAFFIC_INTERVAL = 300  # seconds — same 5-min interval as frontend
+
+async def _fetch_flow_point_server(client, lat: float, lng: float):
+    try:
+        url = f"{TOMTOM_FLOW_BASE}?point={lat},{lng}&unit=KMPH&openLr=false&key={TOMTOM_KEY}"
+        r = await client.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        fd = r.json().get('flowSegmentData', {})
+        current   = fd.get('currentSpeed', 0)
+        free_flow = fd.get('freeFlowSpeed', 0)
+        jam = max(0, min(10, (1 - current / free_flow) * 10)) if free_flow > 0 else 0
+        return {'currentSpeed': current, 'freeFlowSpeed': free_flow, 'jamFactor': jam, 'confidence': fd.get('confidence', 1)}
+    except Exception:
+        return None
+
+async def _server_fetch_traffic(coords: list, n: int = 10):
+    if not coords:
+        return None
+    total = len(coords)
+    step  = max(1, (total - 1) / (n - 1)) if total > n else 1
+    pts   = [coords[min(round(i * step), total - 1)] for i in range(min(n, total))]
+    async with _httpx.AsyncClient() as client:
+        results = [await _fetch_flow_point_server(client, p[0], p[1]) for p in pts]
+    valid = [r for r in results if r]
+    if not valid:
+        return None
+    total_conf = sum(v.get('confidence', 1) for v in valid)
+    avg_jam    = sum(v['jamFactor']    * v.get('confidence', 1) for v in valid) / total_conf
+    avg_speed  = round(sum(v['currentSpeed'] * v.get('confidence', 1) for v in valid) / total_conf)
+    return {'avgJam': avg_jam, 'avgSpeed': avg_speed, 'segments': valid}
+
+async def _traffic_background_task():
+    import time
+    await asyncio.sleep(5)  # wait for app to fully start
+    while True:
+        try:
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cur  = conn.cursor(dictionary=True)
+            cur.execute("SELECT latitude, longitude FROM fire_incidents WHERE status='active' LIMIT 1")
+            row = cur.fetchone()
+            cur.close(); conn.close()
+            if row and row.get('latitude') and row.get('longitude'):
+                lat = float(row['latitude'])
+                lng = float(row['longitude'])
+                traffic = await _server_fetch_traffic([[lat, lng]])
+                if traffic:
+                    traffic['fetchedAt'] = int(time.time() * 1000)
+                    _set_traffic('cards', traffic)
+                    await manager.broadcast({'type': 'traffic_update', 'state': _shared_traffic})
+        except Exception as e:
+            print(f'[FLAMES] Traffic background task error: {e}')
+        await asyncio.sleep(TRAFFIC_INTERVAL)
+
+@asynccontextmanager
+async def lifespan(app):
+    asyncio.create_task(_traffic_background_task())
+    yield
+#-------TOMTOM BACKGROUND TASK END HERE----------------
+
 
 #-----DATA MODELS START HERE----------------
 class UserCreate(BaseModel):
@@ -109,7 +175,7 @@ class RespondIncidentBody(BaseModel):
 #-----DATA MODELS END HERE----------------
 
 
-app = FastAPI(title="FLAMES API")
+app = FastAPI(title="FLAMES API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
