@@ -95,7 +95,11 @@ async def _traffic_background_task():
     import time
     await asyncio.sleep(5)  # wait for app to fully start
     # Per-incident fetch state: { incident_id: last_fetch_ms }
+    # Tracks when each active incident last had TomTom fetched.
+    # Loop runs every 10s so new incidents are detected fast (fetch agad).
+    # Each incident is fetched immediately on first appearance, then every 5 mins.
     _incident_fetch_state: dict = {}
+    POLL_INTERVAL = 10  # seconds — how often to check for new/resolved incidents
     while True:
         try:
             conn = mysql.connector.connect(**DB_CONFIG)
@@ -119,7 +123,8 @@ async def _traffic_background_task():
                 is_new     = inc_id not in _incident_fetch_state
                 age_ms     = now_ms - last_fetch
 
-                # Fetch immediately for new incidents; every 5 mins for existing ones
+                # New incident → fetch immediately (just now)
+                # Existing incident → fetch every 5 mins
                 if is_new or age_ms >= TRAFFIC_INTERVAL * 1000:
                     traffic = await _server_fetch_traffic([[float(lat), float(lng)]])
                     if traffic:
@@ -129,7 +134,7 @@ async def _traffic_background_task():
                         _incident_fetch_state[inc_id] = now_ms
                         broadcast_needed = True
 
-            # Remove resolved incidents from fetch state
+            # Remove resolved incidents — stop fetching for them
             resolved_ids = set(_incident_fetch_state.keys()) - active_ids
             for inc_id in resolved_ids:
                 del _incident_fetch_state[inc_id]
@@ -141,7 +146,7 @@ async def _traffic_background_task():
 
         except Exception as e:
             print(f'[FLAMES] Traffic background task error: {e}')
-        await asyncio.sleep(TRAFFIC_INTERVAL)
+        await asyncio.sleep(POLL_INTERVAL)
 
 @asynccontextmanager
 async def lifespan(app):
