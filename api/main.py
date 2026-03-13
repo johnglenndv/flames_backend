@@ -444,7 +444,13 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
     cur.close()
     conn.close()
     for row in rows:
-        row["display_timestamp"] = convert_to_ph_time(row.get("timestamp"))
+        # Always use local_timestamp (explicitly stored as PH time) for display.
+        # Fallback to convert_to_ph_time only if local_timestamp is missing.
+        lt = row.get("local_timestamp")
+        if lt:
+            row["display_timestamp"] = format_local_timestamp(lt)
+        else:
+            row["display_timestamp"] = convert_to_ph_time(row.get("timestamp"))
     return rows
 
 @app.get("/nodes")
@@ -495,7 +501,13 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     ph_nodes = []
     for row in nodes:
         row_copy = row.copy()
-        row_copy["display_timestamp"] = convert_to_ph_time(row_copy["timestamp"]) if row_copy.get("timestamp") else "N/A"
+        lt = row_copy.get("local_timestamp")
+        if lt:
+            row_copy["display_timestamp"] = format_local_timestamp(lt)
+        elif row_copy.get("timestamp"):
+            row_copy["display_timestamp"] = convert_to_ph_time(row_copy["timestamp"])
+        else:
+            row_copy["display_timestamp"] = "N/A"
         ph_nodes.append(row_copy)
     return ph_nodes
 
