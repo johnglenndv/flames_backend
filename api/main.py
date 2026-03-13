@@ -141,7 +141,7 @@ async def _traffic_background_task():
 
         except Exception as e:
             print(f'[FLAMES] Traffic background task error: {e}')
-        await asyncio.sleep(10)  # Poll every 10s so new incidents are detected fast
+        await asyncio.sleep(10)  # Poll every 10s — detect new incidents fast
 
 @asynccontextmanager
 async def lifespan(app):
