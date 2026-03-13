@@ -94,21 +94,35 @@ async def _server_fetch_traffic(coords: list, n: int = 10):
 async def _traffic_background_task():
     import time
     await asyncio.sleep(5)  # wait for app to fully start
+    _prev_incident_ids = set()   # track known active incident IDs
+    _last_fetch_ms     = 0       # ms epoch of last successful TomTom fetch
     while True:
         try:
             conn = mysql.connector.connect(**DB_CONFIG)
             cur  = conn.cursor(dictionary=True)
-            cur.execute("SELECT latitude, longitude FROM fire_incidents WHERE status='active' LIMIT 1")
-            row = cur.fetchone()
+            cur.execute("SELECT id, latitude, longitude FROM fire_incidents WHERE status='active' LIMIT 10")
+            rows = cur.fetchall()
             cur.close(); conn.close()
-            if row and row.get('latitude') and row.get('longitude'):
-                lat = float(row['latitude'])
-                lng = float(row['longitude'])
-                traffic = await _server_fetch_traffic([[lat, lng]])
-                if traffic:
-                    traffic['fetchedAt'] = int(time.time() * 1000)
-                    _set_traffic('cards', traffic)
-                    await manager.broadcast({'type': 'traffic_update', 'state': _shared_traffic})
+
+            current_ids = {r['id'] for r in rows if r.get('latitude') and r.get('longitude')}
+            new_incident_appeared = bool(current_ids - _prev_incident_ids)
+            _prev_incident_ids = current_ids
+
+            if current_ids:
+                now_ms  = int(time.time() * 1000)
+                age_ms  = now_ms - _last_fetch_ms
+                # Fetch immediately on new incident OR after normal 5-min interval
+                if new_incident_appeared or age_ms >= TRAFFIC_INTERVAL * 1000:
+                    row = rows[0]
+                    lat = float(row['latitude'])
+                    lng = float(row['longitude'])
+                    traffic = await _server_fetch_traffic([[lat, lng]])
+                    if traffic:
+                        traffic['fetchedAt'] = now_ms
+                        _set_traffic('cards', traffic)
+                        _last_fetch_ms = now_ms
+                        await manager.broadcast({'type': 'traffic_update', 'state': _shared_traffic})
+            # No active incidents — skip fetch entirely, just wait
         except Exception as e:
             print(f'[FLAMES] Traffic background task error: {e}')
         await asyncio.sleep(TRAFFIC_INTERVAL)
