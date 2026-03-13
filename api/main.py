@@ -1394,6 +1394,76 @@ async def simulate_fire(
 
     return {"message": f"Fire simulated on {node_id} via {gateway_id}", "timestamp": now}
 
+@app.post("/dev/simulate-fire-2")
+async def simulate_fire(
+    node_id: str = "Node2",
+    gateway_id: str = "GW1",
+    current_user: dict = Depends(get_current_user)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    is_admin = current_user.get('is_admin') == 1
+    user_org = current_user.get('org_id')
+
+    if not is_admin:
+        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
+        gw = cur.fetchone()
+        if not gw:
+            cur.close(); conn.close()
+            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
+        if gw['org_id'] != user_org:
+            cur.close(); conn.close()
+            raise HTTPException(403, "You can only simulate fire on your own organization's gateways")
+
+    now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("""
+        INSERT INTO sensor_readings
+        (gateway_id, node_id, timestamp, local_timestamp,
+         temperature, humidity, flame, smoke,
+         latitude, longitude, rssi, snr, ai_prediction, confidence)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (gateway_id, node_id, now, now,
+          52.3, 25, 1, 920,
+          16.0379, 120.3468,
+          -68, 7.2, 'fire', 0.95))
+
+    upsert_fire_incident(cur, {
+        "node_id":        node_id,
+        "gateway_id":     gateway_id,
+        "ai_prediction":  "fire",
+        "confidence":     0.95,
+        "temperature":    52.3,
+        "humidity":       25,
+        "flame":          1,
+        "smoke":          920,
+        "latitude":       16.0379,
+        "longitude":      120.3468,
+        "local_timestamp": now,
+    })
+
+    conn.commit()
+    cur.close(); conn.close()
+
+    # Broadcast both incident_update AND node_update so all clients react immediately
+    await manager.broadcast({
+        "type":          "incident_update",
+        "node_id":       node_id,
+        "gateway_id":    gateway_id,
+        "ai_prediction": "fire",
+        "confidence":    0.95,
+        "timestamp":     now,
+        "latitude":      16.0379,
+        "longitude":     120.3468,
+    })
+    await manager.broadcast({
+        "type":    "node_update",
+        "node_id": node_id,
+    })
+
+    return {"message": f"Fire simulated on {node_id} via {gateway_id}", "timestamp": now}
+
 
 @app.post("/dev/simulate-false")
 async def simulate_false(
@@ -1521,6 +1591,70 @@ async def simulate_normal(
         "timestamp":     now,
         "latitude":      16.0435,
         "longitude":     120.3351,
+    })
+    await manager.broadcast({
+        "type":    "node_update",
+        "node_id": node_id,
+    })
+
+    return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
+
+
+@app.post("/dev/simulate-normal-2")
+async def simulate_normal(
+    node_id: str = "Node2",
+    gateway_id: str = "GW1",
+    current_user: dict = Depends(get_current_user)
+):
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor(dictionary=True)
+
+    is_admin = current_user.get('is_admin') == 1
+    user_org = current_user.get('org_id')
+
+    if not is_admin:
+        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
+        gw = cur.fetchone()
+        if not gw:
+            cur.close(); conn.close()
+            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
+        if gw['org_id'] != user_org:
+            cur.close(); conn.close()
+            raise HTTPException(403, "You can only simulate on your own organization's gateways")
+
+    now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("""
+        INSERT INTO sensor_readings
+        (gateway_id, node_id, timestamp, local_timestamp,
+         temperature, humidity, flame, smoke,
+         latitude, longitude, rssi, snr, ai_prediction, confidence)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (gateway_id, node_id, now, now,
+          24.5, 61, 0, 0,
+          16.0379, 120.3468,
+          -68, 7.2, 'normal', 0.99))
+
+    upsert_fire_incident(cur, {
+        "node_id":        node_id,
+        "gateway_id":     gateway_id,
+        "ai_prediction":  "normal",
+        "local_timestamp": now,
+    })
+
+    conn.commit()
+    cur.close(); conn.close()
+
+    # Broadcast both incident_update AND node_update so all clients react immediately
+    await manager.broadcast({
+        "type":          "incident_update",
+        "node_id":       node_id,
+        "gateway_id":    gateway_id,
+        "ai_prediction": "normal",
+        "confidence":    0.99,
+        "timestamp":     now,
+        "latitude":      16.0379,
+        "longitude":     120.3468,
     })
     await manager.broadcast({
         "type":    "node_update",
