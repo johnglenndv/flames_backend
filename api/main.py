@@ -171,6 +171,8 @@ class ResolveIncidentBody(BaseModel):
 class RespondIncidentBody(BaseModel):
     organization_id: int | None = None
     organization_name: str | None = None
+    dispatch_time: str | None = None   # ISO or local string when rescue was dispatched
+    vehicle_type: str | None = None    # e.g. "firetruck", "ambulance"
 
 #-----DATA MODELS END HERE----------------
 
@@ -828,6 +830,8 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "started_at":     format_local_timestamp(row["started_at"]),
             "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
             "assigned_team":  row["assigned_team"],
+            "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
+            "vehicle_type":   row.get("vehicle_type"),
         })
     return incidents
 
@@ -942,6 +946,8 @@ async def get_resolved_incidents(
             "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
             "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
             "assigned_team":  row.get("assigned_team"),
+            "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
+            "vehicle_type":   row.get("vehicle_type"),
         })
     return result
 
@@ -988,6 +994,8 @@ async def get_incident_by_id(
         "flame":          row.get("flame"),
         "notes":          row.get("notes"),
         "assigned_team":  row.get("assigned_team"),
+        "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
+        "vehicle_type":   row.get("vehicle_type"),
         "timestamp":      format_local_timestamp(row.get("last_updated_at")),
         "started_at":     format_local_timestamp(row.get("started_at")),
         "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
@@ -1012,9 +1020,13 @@ async def respond_to_incident(
         raise HTTPException(404, "Incident not found")
 
     assigned_team = body.organization_name or str(body.organization_id) or "Unknown"
+    dispatch_time = body.dispatch_time or datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    vehicle_type  = body.vehicle_type or None
     cur.execute("""
-        UPDATE fire_incidents SET assigned_team = %s WHERE id = %s
-    """, (assigned_team, incident_id))
+        UPDATE fire_incidents
+        SET assigned_team = %s, dispatch_time = %s, vehicle_type = %s
+        WHERE id = %s
+    """, (assigned_team, dispatch_time, vehicle_type, incident_id))
     conn.commit()
 
     node_id = inc["node_id"]
