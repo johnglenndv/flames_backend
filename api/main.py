@@ -1020,8 +1020,21 @@ async def respond_to_incident(
         raise HTTPException(404, "Incident not found")
 
     assigned_team = body.organization_name or str(body.organization_id) or "Unknown"
-    dispatch_time = body.dispatch_time or datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
     vehicle_type  = body.vehicle_type or None
+
+    # Fetch existing dispatch info to detect edit vs fresh dispatch
+    cur.execute("SELECT assigned_team, dispatch_time FROM fire_incidents WHERE id = %s", (incident_id,))
+    existing_dispatch = cur.fetchone()
+    is_edit = bool(existing_dispatch and existing_dispatch.get("assigned_team"))
+
+    # Preserve original dispatch_time on edits unless explicitly provided
+    if is_edit and not body.dispatch_time:
+        dispatch_time = format_local_timestamp(existing_dispatch.get("dispatch_time")) \
+                        if existing_dispatch.get("dispatch_time") else \
+                        datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        dispatch_time = body.dispatch_time or datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
     cur.execute("""
         UPDATE fire_incidents
         SET assigned_team = %s, dispatch_time = %s, vehicle_type = %s
@@ -1032,13 +1045,17 @@ async def respond_to_incident(
     node_id = inc["node_id"]
     cur.close(); conn.close()
 
-    # Broadcast to all connected clients so they update immediately
+    # Broadcast full dispatch details so ALL clients (logged in or not) can update their
+    # rescue map — whether this is a fresh dispatch or an edit to an existing one.
+    broadcast_action = "dispatch_updated" if is_edit else "responded"
     await manager.broadcast({
-        "type":        "incident_update",
-        "incident_id": incident_id,
-        "action":      "responded",
-        "node_id":     node_id,
-        "org_name":    assigned_team,
+        "type":          "incident_update",
+        "incident_id":   incident_id,
+        "action":        broadcast_action,
+        "node_id":       node_id,
+        "org_name":      assigned_team,
+        "dispatch_time": dispatch_time,
+        "vehicle_type":  vehicle_type,
     })
     await manager.broadcast({
         "type":    "node_update",
