@@ -199,6 +199,9 @@ class InviteCodeAdminCreate(BaseModel):
 
 class ResolveIncidentBody(BaseModel):
     notes: str | None = None
+    resolved_dist_km: float | None = None
+    resolved_eta_min: int | None = None
+    resolved_peak: str | None = None
 
 class RespondIncidentBody(BaseModel):
     organization_id: int | None = None
@@ -985,7 +988,10 @@ async def get_resolved_incidents(
             "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
             "assigned_team":  row.get("assigned_team"),
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
-            "vehicle_type":   row.get("vehicle_type"),
+            "vehicle_type":       row.get("vehicle_type"),
+            "resolved_dist_km":   row.get("resolved_dist_km"),
+            "resolved_eta_min":   row.get("resolved_eta_min"),
+            "resolved_peak":      row.get("resolved_peak"),
         })
     return result
 
@@ -1127,9 +1133,10 @@ async def resolve_incident(
 
     cur.execute("""
         UPDATE fire_incidents
-        SET status = 'resolved', resolved_at = %s, notes = %s
+        SET status = 'resolved', resolved_at = %s, notes = %s,
+            resolved_dist_km = %s, resolved_eta_min = %s, resolved_peak = %s
         WHERE id = %s
-    """, (now_str, body.notes, incident_id))
+    """, (now_str, body.notes, body.resolved_dist_km, body.resolved_eta_min, body.resolved_peak, incident_id))
     conn.commit()
     cur.close(); conn.close()
 
