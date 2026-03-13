@@ -759,6 +759,8 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 fi.started_at,
                 fi.last_updated_at,
                 fi.assigned_team,
+                fi.dispatch_time,
+                fi.vehicle_type,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             WHERE fi.status = 'active'
@@ -785,6 +787,8 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 fi.started_at,
                 fi.last_updated_at,
                 fi.assigned_team,
+                fi.dispatch_time,
+                fi.vehicle_type,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
