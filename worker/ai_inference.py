@@ -141,25 +141,25 @@ def on_message(client, userdata, msg):
         else:
     # ── CASE 3: Normal AI path ──
     # Apply safety filter only when no manual override involved
-    if final_label.lower() in ["fire", "false"]:
-        # A real fire needs MULTIPLE sensor agreement — not just flame alone.
-        # Flame sensor alone (high f, low smoke, normal temp) is almost always
-        # ambient IR / sunlight interference.
-        smoke_is_low   = s < 50
-        temp_is_normal = t < 40
-        temp_stable    = abs(t_delta) < 1.0
-        no_smoke_rise  = s_delta < 20
-        # Flame-only false positive: high flame reading but no smoke, normal temp
-        flame_only_trigger = f > 0 and smoke_is_low and temp_is_normal
+            if final_label.lower() in ["fire", "false"]:
+                # A real fire needs MULTIPLE sensor agreement — not just flame alone.
+                # Flame sensor alone (high f, low smoke, normal temp) is almost always
+                # ambient IR / sunlight interference.
+                smoke_is_low   = s < 50
+                temp_is_normal = t < 40
+                temp_stable    = abs(t_delta) < 1.0
+                no_smoke_rise  = s_delta < 20
+                # Flame-only false positive: high flame reading but no smoke, normal temp
+                flame_only_trigger = f > 0 and smoke_is_low and temp_is_normal
 
-        if flame_only_trigger and temp_stable and no_smoke_rise:
-            final_label = "Normal"
-            confidence  = 0.97
-            print(f"  🌡  [{node}] Safety filter: flame-only trigger, no smoke/temp rise → Normal")
-        elif abs(t_delta) < 0.2 and s < 30:
-            final_label = "Normal"
-            confidence  = 0.98
-            print(f"  🌡  [{node}] Safety filter: stable temp + low smoke → Normal")
+                if flame_only_trigger and temp_stable and no_smoke_rise:
+                    final_label = "Normal"
+                    confidence  = 0.97
+                    print(f"  🌡  [{node}] Safety filter: flame-only trigger, no smoke/temp rise → Normal")
+                elif abs(t_delta) < 0.2 and s < 30:
+                    final_label = "Normal"
+                    confidence  = 0.98
+                    print(f"  🌡  [{node}] Safety filter: stable temp + low smoke → Normal")
 
         print(f"  [{node}] AI={ai_label}({ai_confidence*100:.1f}%) "
               f"→ Final={final_label}({confidence*100:.1f}%) "
