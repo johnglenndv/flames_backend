@@ -104,7 +104,6 @@ async def _traffic_background_task():
             rows = cur.fetchall()
             cur.close(); conn.close()
 
-            now_ms = int(time.time() * 1000)
             active_ids = set()
             broadcast_needed = False
 
@@ -117,16 +116,19 @@ async def _traffic_background_task():
                 active_ids.add(inc_id)
                 last_fetch = _incident_fetch_state.get(inc_id, 0)
                 is_new     = inc_id not in _incident_fetch_state
-                age_ms     = now_ms - last_fetch
+                # Use per-incident time so each incident gets its own fetchedAt
+                now_ms = int(time.time() * 1000)
+                age_ms = now_ms - last_fetch
 
                 # Fetch immediately for new incidents; every 5 mins for existing ones
                 if is_new or age_ms >= TRAFFIC_INTERVAL * 1000:
                     traffic = await _server_fetch_traffic([[float(lat), float(lng)]])
                     if traffic:
-                        traffic['fetchedAt'] = now_ms
+                        fetch_ms = int(time.time() * 1000)  # timestamp AFTER fetch completes
+                        traffic['fetchedAt'] = fetch_ms
                         traffic['incidentId'] = inc_id
                         _set_traffic(f'incident_{inc_id}', traffic)
-                        _incident_fetch_state[inc_id] = now_ms
+                        _incident_fetch_state[inc_id] = fetch_ms
                         broadcast_needed = True
 
             # Remove resolved incidents from fetch state
@@ -141,7 +143,7 @@ async def _traffic_background_task():
 
         except Exception as e:
             print(f'[FLAMES] Traffic background task error: {e}')
-        await asyncio.sleep(TRAFFIC_INTERVAL)
+        await asyncio.sleep(10)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -863,6 +865,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "timestamp":      format_local_timestamp(row["last_updated_at"]),
             "started_at":     format_local_timestamp(row["started_at"]),
             "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
+            "resolved_at":    format_local_timestamp(row["resolved_at"]) if row.get("resolved_at") else None,
             "assigned_team":  row["assigned_team"],
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
@@ -972,10 +975,12 @@ async def get_resolved_incidents(
             "status":         "Resolved",
             "status_class":   "txt-resolved",
             "temperature":    row.get("temperature"),
+            "humidity":       row.get("humidity"),
             "smoke":          row.get("smoke"),
             "flame":          row.get("flame"),
             "notes":          row.get("notes"),
-            "timestamp":      format_local_timestamp(row.get("last_updated_at")),
+            "sensor_at":      format_local_timestamp(row.get("last_updated_at")),
+            "timestamp":      format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else format_local_timestamp(row.get("last_updated_at")),
             "started_at":     format_local_timestamp(row.get("started_at")),
             "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
             "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
