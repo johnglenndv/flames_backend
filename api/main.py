@@ -1570,10 +1570,110 @@ async def create_invite_code_for_org(
 
 @app.post("/notify-new-data")
 async def notify_new_data(data: dict):
-    # Derive trigger_source from manual_fire flag so dashboard can display the badge
+    # ── 1. Derive trigger_source ───────────────────────────────────────────────
     if "trigger_source" not in data:
         data["trigger_source"] = "manual" if data.get("manual_fire") else "ai"
+
+    pred       = (data.get("ai_prediction") or "").lower()
+    node_id    = data.get("node_id")
+    gateway_id = data.get("gateway_id")
+    is_fire    = pred in ("fire", "false")
+    is_normal  = pred == "normal"
+
+    # ── 2. Normalise confidence ────────────────────────────────────────────────
+    conf_raw = data.get("confidence", 0)
+    try:
+        conf_val = float(str(conf_raw).replace("%", ""))
+        if conf_val > 1:
+            conf_val /= 100
+    except (ValueError, TypeError):
+        conf_val = 0.0
+
+    # ── 3. DB work ─────────────────────────────────────────────────────────────
+    resolved_incident_id = None
+    new_or_updated_inc   = None
+    try:
+        conn = get_db_conn()
+        cur  = conn.cursor(dictionary=True)
+        now_str = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+        if is_fire and node_id:
+            upsert_fire_incident(cur, {
+                "node_id":        node_id,
+                "gateway_id":     gateway_id,
+                "ai_prediction":  pred,
+                "confidence":     conf_val,
+                "temperature":    data.get("temperature"),
+                "humidity":       data.get("humidity"),
+                "flame":          data.get("flame"),
+                "smoke":          data.get("smoke"),
+                "latitude":       data.get("latitude"),
+                "longitude":      data.get("longitude"),
+                "local_timestamp": now_str,
+                "manual_fire":    data.get("manual_fire", False),
+                "trigger_source": data.get("trigger_source"),
+            })
+            conn.commit()
+            cur.execute("""
+                SELECT id, trigger_source, latitude, longitude
+                FROM fire_incidents
+                WHERE node_id = %s AND status = 'active'
+                LIMIT 1
+            """, (node_id,))
+            new_or_updated_inc = cur.fetchone()
+
+        elif is_normal and node_id:
+            cur.execute("""
+                SELECT id FROM fire_incidents
+                WHERE node_id = %s AND status = 'active'
+                LIMIT 1
+            """, (node_id,))
+            active = cur.fetchone()
+            if active:
+                cur.execute("""
+                    UPDATE fire_incidents
+                    SET status = 'resolved', resolved_at = %s
+                    WHERE id = %s
+                """, (now_str, active["id"]))
+                conn.commit()
+                resolved_incident_id = active["id"]
+
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"[notify-new-data] DB error: {e}")
+
+    # ── 4. Broadcast raw sensor reading ────────────────────────────────────────
     await manager.broadcast(data)
+
+    # ── 5. Broadcast incident_update so dashboard refreshes incident list ──────
+    if new_or_updated_inc:
+        await manager.broadcast({
+            "type":           "incident_update",
+            "action":         "new_or_updated",
+            "incident_id":    new_or_updated_inc["id"],
+            "node_id":        node_id,
+            "gateway_id":     gateway_id,
+            "ai_prediction":  pred,
+            "confidence":     conf_val,
+            "trigger_source": data.get("trigger_source"),
+            "manual_fire":    data.get("manual_fire", False),
+            "latitude":       data.get("latitude"),
+            "longitude":      data.get("longitude"),
+            "temperature":    data.get("temperature"),
+            "humidity":       data.get("humidity"),
+            "flame":          data.get("flame"),
+            "smoke":          data.get("smoke"),
+        })
+    elif resolved_incident_id:
+        await manager.broadcast({
+            "type":           "incident_update",
+            "action":         "resolved",
+            "incident_id":    resolved_incident_id,
+            "node_id":        node_id,
+            "ai_prediction":  pred,
+        })
+
     return {"status": "broadcasted"}
 
 
