@@ -44,111 +44,161 @@ def on_message(client, userdata, msg):
     try:
         data = json.loads(msg.payload.decode())
         gateway_id = data.get("gateway")
-        payload = data.get("payload", {})
-        node = payload.get("node")
+        payload    = data.get("payload", {})
+        node       = payload.get("node")
         if not node: return
 
-        # Raw Data Extraction
-        t, h = payload.get("temp"), payload.get("hum")
-        f, s = payload.get("flame", 0), payload.get("smoke", 0)
-        lat, lon = payload.get("lat"), payload.get("lon")
-        rssi, snr = data.get("rssi"), data.get("snr")
-        ts_final = data.get("received_at", datetime.utcnow().isoformat())
-        ts_early = data.get("received_at_early", ts_final)
+        # ── Raw sensor data — always real values from device ──
+        t   = payload.get("temp")
+        h   = payload.get("hum")
+        f   = payload.get("flame", 0)
+        s   = payload.get("smoke", 0)
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        rssi        = data.get("rssi")
+        snr         = data.get("snr")
+        ts_final    = data.get("received_at", datetime.utcnow().isoformat())
+        ts_early    = data.get("received_at_early", ts_final)
 
-        # ── Manual fire button flag ──
+        # ── Manual fire flag — set by physical button on device ──
+        # This flag alone is enough to trigger fire alert.
+        # Real sensor values are stored in DB regardless.
         manual_fire = payload.get("manual_fire", False)
-        if manual_fire:
-            print(f"  🚨 MANUAL FIRE BUTTON pressed on {node} — bypassing AI")
 
-        # REAL-TIME TEMPORAL ENGINEERING
-        prev = node_history.get(node, {'t': t, 's': s, 'f': f, 'h': h, 'manual_fire_active': False})
+        # ── Temporal feature engineering ──
+        prev = node_history.get(node, {
+            't': t, 's': s, 'f': f, 'h': h,
+            'manual_fire_active': False
+        })
 
-        t_delta, s_delta = t - prev['t'], s - prev['s']
-        f_delta, h_delta = f - prev['f'], h - prev['h']
-        t_roll, s_roll = (t + prev['t']) / 2, (s + prev['s']) / 2
+        t_delta = t - prev['t']
+        s_delta = s - prev['s']
+        f_delta = f - prev['f']
+        h_delta = h - prev['h']
+        t_roll  = (t + prev['t']) / 2
+        s_roll  = (s + prev['s']) / 2
 
+        # Update history with real values
         node_history[node] = {
             't': t, 's': s, 'f': f, 'h': h,
-            'manual_fire_active': node_history.get(node, {}).get('manual_fire_active', False)
+            'manual_fire_active': prev.get('manual_fire_active', False)
         }
 
-        # AI INFERENCE
+        # ── AI inference on REAL sensor values ──
         features = [s, t, f, h, t_delta, s_delta, f_delta, h_delta, t_roll, s_roll]
         input_df = pd.DataFrame([features], columns=[
             'smoke', 'temperature', 'flame', 'humidity',
             'temp_delta', 'smoke_delta', 'flame_delta', 'hum_delta',
             'temp_roll_avg', 'smoke_roll_avg'
         ])
-
         scaled_input = scaler.transform(input_df)
-        probs = model.predict_proba(scaled_input)[0]
-        final_label = class_names[np.argmax(probs)]
-        confidence = float(np.max(probs))
+        probs        = model.predict_proba(scaled_input)[0]
+        ai_label     = class_names[np.argmax(probs)]
+        ai_confidence = float(np.max(probs))
 
-        # ── MANUAL FIRE OVERRIDE — check FIRST, bypasses AI + safety filter ──
+        # ── Decision logic ──
+        #
+        # Priority order:
+        # 1. manual_fire=true  → always fire, confidence 1.0, lock node
+        # 2. manual_fire=false + lock active → keep fire until sensors clear
+        # 3. normal AI result  → use AI with safety filter
+        #
+        final_label = ai_label
+        confidence  = ai_confidence
+
         if manual_fire:
+            # ── CASE 1: Button pressed on device ──
+            # Force fire regardless of AI or sensor readings.
+            # Real sensor values are still stored in DB for audit.
             final_label = "fire"
             confidence  = 1.0
-            node_history[node]['manual_fire_active'] = True  # Lock incident open
-            print(f"  ✅ Manual fire override applied: label=fire, confidence=1.0")
+            node_history[node]['manual_fire_active'] = True
+            print(f"  🚨 [{node}] MANUAL FIRE BUTTON — label forced to fire")
+
+        elif prev.get('manual_fire_active', False):
+            # ── CASE 2: Button was pressed in a previous reading ──
+            # Keep fire label active until sensors confirm all-clear.
+            # This prevents the incident from auto-resolving on the
+            # next 60s reading just because the button is no longer held.
+            sensors_all_clear = (
+                ai_label.lower() == "normal" and
+                f == 0 and
+                s < 20 and
+                t < 40
+            )
+            if sensors_all_clear:
+                # Sensors genuinely clear — release the lock
+                node_history[node]['manual_fire_active'] = False
+                final_label = "Normal"
+                confidence  = ai_confidence
+                print(f"  ✅ [{node}] Manual fire lock released — sensors confirm normal")
+            else:
+                # Lock still holds — keep fire label
+                final_label = "fire"
+                confidence  = 1.0
+                print(f"  🔒 [{node}] Manual fire lock active — keeping fire label")
+
         else:
-            # HOT DAY OVERRIDE (Safety Filter) — only runs if NOT a manual fire
+            # ── CASE 3: Normal AI path ──
+            # Apply safety filter only when no manual override involved
             if final_label.lower() in ["fire", "false"]:
                 if abs(t_delta) < 0.2 and s < 30:
-                    # Don't resolve if manual fire incident is still active
-                    if not node_history.get(node, {}).get('manual_fire_active', False):
-                        final_label, confidence = "Normal", 0.98
+                    final_label = "Normal"
+                    confidence  = 0.98
+                    print(f"  🌡  [{node}] Safety filter: stable temp + low smoke → Normal")
 
-            # Only clear manual_fire_active lock if sensors confirm sustained all-clear
-            if node_history.get(node, {}).get('manual_fire_active', False):
-                if final_label.lower() == "normal" and f == 0 and s < 20 and t < 40:
-                    node_history[node]['manual_fire_active'] = False
-                    print(f"  ✅ Manual fire lock released for {node} — sensors confirm normal")
-                else:
-                    # Keep fire label active while lock is on
-                    final_label = "fire"
-                    confidence  = 1.0
-                    print(f"  🔒 Manual fire lock still active for {node}")
+        print(f"  [{node}] AI={ai_label}({ai_confidence*100:.1f}%) "
+              f"→ Final={final_label}({confidence*100:.1f}%) "
+              f"| T={t} H={h} Flame={f} Smoke={s}"
+              f"{' [MANUAL BUTTON]' if manual_fire else ''}")
 
-        # DATABASE INSERT
+        # ── Database insert — always stores REAL sensor values ──
         conn = mysql.connector.connect(**DB_CONFIG)
         ensure_gateway_exists(conn, gateway_id)
         cur = conn.cursor()
         sql = """
             INSERT INTO sensor_readings
-            (gateway_id, node_id, timestamp, local_timestamp, temperature, humidity,
-             flame, smoke, latitude, longitude, rssi, snr, ai_prediction, confidence,
-             temp_delta, smoke_delta, flame_delta, hum_delta, temp_roll_avg, smoke_roll_avg)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (gateway_id, node_id, timestamp, local_timestamp,
+             temperature, humidity, flame, smoke,
+             latitude, longitude, rssi, snr,
+             ai_prediction, confidence,
+             temp_delta, smoke_delta, flame_delta, hum_delta,
+             temp_roll_avg, smoke_roll_avg)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """
         cur.execute(sql, (
-            gateway_id, node, ts_final, ts_early, t, h, f, s, lat, lon, rssi, snr,
-            final_label, confidence, t_delta, s_delta, f_delta, h_delta, t_roll, s_roll
+            gateway_id, node, ts_final, ts_early,
+            t, h, f, s,              # real sensor values
+            lat, lon, rssi, snr,
+            final_label, confidence, # overridden label if manual
+            t_delta, s_delta, f_delta, h_delta,
+            t_roll, s_roll
         ))
         conn.commit()
         cur.close()
         conn.close()
 
-        # DASHBOARD NOTIFY
-        requests.post("https://flamesapp.up.railway.app/notify-new-data", json={
-            "type":          "new_reading",
-            "node_id":       node,
-            "ai_prediction": final_label,
-            "confidence":    f"{confidence*100:.2f}%",
-            "temperature":   t,
-            "smoke":         s,
-            "flame":         f,
-            "rssi":          rssi,
-            "temp_delta":    round(t_delta, 2),
-            "manual_fire":   manual_fire
-        }, timeout=2)
-
-        print(f"  Result: {final_label} ({confidence*100:.1f}%)"
-              + (" [MANUAL BUTTON]" if manual_fire else ""))
+        # ── Dashboard notify ──
+        requests.post(
+            "https://flamesapp.up.railway.app/notify-new-data",
+            json={
+                "type":          "new_reading",
+                "node_id":       node,
+                "ai_prediction": final_label,
+                "confidence":    f"{confidence*100:.2f}%",
+                "temperature":   t,
+                "humidity":      h,
+                "smoke":         s,
+                "flame":         f,
+                "rssi":          rssi,
+                "temp_delta":    round(t_delta, 2),
+                "manual_fire":   manual_fire,
+            },
+            timeout=2
+        )
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error in on_message: {e}")
 
 # --- 4. START ---
 client = mqtt.Client()
