@@ -115,14 +115,21 @@ async def _traffic_background_task():
                 if not lat or not lng:
                     continue
                 active_ids.add(inc_id)
-                last_fetch = _incident_fetch_state.get(inc_id, 0)
-                is_new     = inc_id not in _incident_fetch_state
-                # Use per-incident time so each incident gets its own fetchedAt
                 now_ms = int(time.time() * 1000)
+                # Check in-memory fetch state first, then fall back to _shared_traffic
+                # This prevents re-fetching after server restart if data is still fresh
+                last_fetch = _incident_fetch_state.get(inc_id, 0)
+                if not last_fetch:
+                    # Check if we already have fresh data in shared state from before restart
+                    existing = _shared_traffic.get(f'incident_{inc_id}')
+                    if existing and existing.get('fetchedAt'):
+                        last_fetch = existing['fetchedAt']
+                        _incident_fetch_state[inc_id] = last_fetch
+
                 age_ms = now_ms - last_fetch
 
-                # Fetch immediately for new incidents; every 5 mins for existing ones
-                if is_new or age_ms >= TRAFFIC_INTERVAL * 1000:
+                # Only fetch if we have no data at all, or data is older than 5 minutes
+                if age_ms >= TRAFFIC_INTERVAL * 1000:
                     traffic = await _server_fetch_traffic([[float(lat), float(lng)]])
                     if traffic:
                         fetch_ms = int(time.time() * 1000)  # timestamp AFTER fetch completes
