@@ -540,6 +540,14 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     for row in nodes:
         row_copy = row.copy()
         row_copy["display_timestamp"] = convert_to_ph_time(row_copy["timestamp"]) if row_copy.get("timestamp") else "N/A"
+        # Convert raw UTC datetime to ISO string with 'Z' suffix so the dashboard
+        # knows it's UTC — prevents 8-hour offset error in offline detection
+        if row_copy.get("timestamp") and not isinstance(row_copy["timestamp"], str):
+            row_copy["timestamp"] = row_copy["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif row_copy.get("timestamp") and isinstance(row_copy["timestamp"], str):
+            ts = row_copy["timestamp"].replace(' ', 'T')
+            if not ts.endswith('Z') and '+' not in ts:
+                row_copy["timestamp"] = ts + 'Z'
         ph_nodes.append(row_copy)
     return ph_nodes
 
