@@ -3,6 +3,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import mysql.connector
+from mysql.connector import pooling as _mysql_pooling
 import os
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -98,7 +99,7 @@ async def _traffic_background_task():
     _incident_fetch_state: dict = {}
     while True:
         try:
-            conn = mysql.connector.connect(**DB_CONFIG)
+            conn = get_db_conn()
             cur  = conn.cursor(dictionary=True)
             cur.execute("SELECT id, latitude, longitude FROM fire_incidents WHERE status='active'")
             rows = cur.fetchall()
@@ -227,12 +228,39 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 DB_CONFIG = {
-    "host": os.getenv("MYSQLHOST"),
-    "port": int(os.getenv("MYSQLPORT", 3306)),
-    "user": os.getenv("MYSQLUSER"),
+    "host":     os.getenv("MYSQLHOST"),
+    "port":     int(os.getenv("MYSQLPORT", 3306)),
+    "user":     os.getenv("MYSQLUSER"),
     "password": os.getenv("MYSQLPASSWORD"),
     "database": os.getenv("MYSQLDATABASE"),
 }
+
+# -- Connection Pool ----------------------------------------------------------
+# Reuses existing MySQL connections instead of opening a new one per request.
+# pool_size=10 supports up to 10 simultaneous DB calls without waiting.
+_db_pool = None
+
+def _init_pool():
+    global _db_pool
+    try:
+        _db_pool = _mysql_pooling.MySQLConnectionPool(
+            pool_name="flames_pool",
+            pool_size=10,
+            pool_reset_session=True,
+            **DB_CONFIG,
+        )
+        print("[FLAMES] DB connection pool initialized (size=10)")
+    except Exception as e:
+        print(f"[FLAMES] WARNING: Could not create pool: {e}. Using direct connect.")
+        _db_pool = None
+
+def get_db_conn():
+    """Get a pooled connection, or direct connection as fallback."""
+    if _db_pool:
+        return _db_pool.get_connection()
+    return mysql.connector.connect(**DB_CONFIG)
+
+_init_pool()
 
 PH_ZONE = ZoneInfo("Asia/Manila")
 
@@ -301,7 +329,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     except JWTError:
         raise credentials_exception
 
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT * FROM users WHERE username = %s", (username,))
     user = cur.fetchone()
@@ -410,7 +438,7 @@ async def websocket_endpoint(websocket: WebSocket):
 #-----API ENDPOINTS START HERE----------------
 @app.get("/latest/{node_id}")
 async def get_latest(node_id: str, current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT id, node_id, timestamp, temperature, humidity, flame, smoke,
@@ -430,7 +458,7 @@ async def get_latest(node_id: str, current_user: dict = Depends(get_current_user
 
 @app.get("/history/{node_id}")
 async def get_history(node_id: str, limit: int = 50, current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT id, node_id, timestamp, local_timestamp, temperature, humidity, flame, smoke,
@@ -449,40 +477,49 @@ async def get_history(node_id: str, limit: int = 50, current_user: dict = Depend
 
 @app.get("/nodes")
 async def get_all_nodes(current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
 
-    LATEST = """
-        (SELECT temperature    FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS temperature,
-        (SELECT humidity       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS humidity,
-        (SELECT flame          FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS flame,
-        (SELECT smoke          FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS smoke,
-        (SELECT latitude       FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS latitude,
-        (SELECT longitude      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS longitude,
-        (SELECT rssi           FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS rssi,
-        (SELECT snr            FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS snr,
-        (SELECT timestamp      FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS timestamp,
-        (SELECT local_timestamp FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS local_timestamp,
-        (SELECT ai_prediction  FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS ai_prediction,
-        (SELECT confidence     FROM sensor_readings WHERE node_id = s.node_id ORDER BY id DESC LIMIT 1) AS confidence
-    """
-
+    # Optimized: single JOIN on the latest reading per node (vs 12 correlated subqueries).
+    # Uses a subquery to find max(id) per node, then joins once — much faster.
     if is_admin:
-        cur.execute(f"""
-            SELECT DISTINCT s.node_id, {LATEST}
+        cur.execute("""
+            SELECT
+                s.node_id,
+                s.gateway_id,
+                s.temperature, s.humidity, s.flame, s.smoke,
+                s.latitude, s.longitude, s.rssi, s.snr,
+                s.timestamp, s.local_timestamp,
+                s.ai_prediction, s.confidence
             FROM sensor_readings s
+            INNER JOIN (
+                SELECT node_id, MAX(id) AS max_id
+                FROM sensor_readings
+                GROUP BY node_id
+            ) latest ON s.id = latest.max_id
             ORDER BY s.node_id
         """)
     else:
         if not user_org:
             cur.close(); conn.close()
             return []
-        cur.execute(f"""
-            SELECT DISTINCT s.node_id, {LATEST}
+        cur.execute("""
+            SELECT
+                s.node_id,
+                s.gateway_id,
+                s.temperature, s.humidity, s.flame, s.smoke,
+                s.latitude, s.longitude, s.rssi, s.snr,
+                s.timestamp, s.local_timestamp,
+                s.ai_prediction, s.confidence
             FROM sensor_readings s
+            INNER JOIN (
+                SELECT node_id, MAX(id) AS max_id
+                FROM sensor_readings
+                GROUP BY node_id
+            ) latest ON s.id = latest.max_id
             INNER JOIN gateways g ON g.gateway_id = s.gateway_id
             WHERE g.org_id = %s
             ORDER BY s.node_id
@@ -502,7 +539,7 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
 
 @app.get("/organizations", response_model=list[Organization])
 async def get_organizations(current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     if current_user.get('is_admin') == 1:
         cur.execute("SELECT id, name, invite_code FROM organizations ORDER BY name")
@@ -523,7 +560,7 @@ async def create_organization(
     current_user: dict = Depends(get_current_user),
     _admin: dict = Depends(admin_required)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     cur.execute("SELECT id FROM organizations WHERE name = %s", (org.name,))
@@ -560,7 +597,7 @@ async def get_gateways(
     org_id: Optional[int] = None,
     current_user: dict = Depends(get_current_user)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -603,7 +640,7 @@ async def assign_gateway_to_org(
     current_user: dict = Depends(get_current_user),
     _admin: dict = Depends(admin_required)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     cur.execute("SELECT id FROM organizations WHERE id = %s", (body.org_id,))
@@ -628,7 +665,7 @@ async def disassociate_gateway_from_org(
     current_user: dict = Depends(get_current_user),
     _admin: dict = Depends(admin_required)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     cur.execute("SELECT gateway_id, org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
@@ -650,7 +687,7 @@ async def disassociate_gateway_from_org(
 
 @app.get("/me")
 async def get_current_user_info(current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT u.id, u.username, u.email, u.created_at, u.is_admin,
@@ -673,12 +710,173 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_id":   full_user["org_id"],
         "organization_name": full_user["organization_name"] or "—",
     }
+
+# ── Dashboard Init (consolidates 5 startup requests into 1) ─────────────────
+@app.get("/dashboard-init")
+async def dashboard_init(current_user: dict = Depends(get_current_user)):
+    """Returns everything the dashboard needs on first load in a single request:
+    user info, gateways, nodes (latest reading per node), and active incidents.
+    Reduces startup from ~6 sequential HTTP round-trips to 1."""
+    conn = get_db_conn()
+    cur = conn.cursor(dictionary=True)
+    user_org = current_user.get("org_id")
+    is_admin = current_user.get("is_admin") == 1
+
+    # 1) User + org info
+    cur.execute("""
+        SELECT u.id, u.username, u.email, u.created_at, u.is_admin,
+               o.id AS org_id, o.name AS organization_name
+        FROM users u
+        LEFT JOIN organizations o ON u.org_id = o.id
+        WHERE u.id = %s
+    """, (current_user["id"],))
+    full_user = cur.fetchone()
+
+    # 2) Gateways
+    if is_admin:
+        cur.execute("""
+            SELECT g.gateway_id, g.org_id, g.location_name, g.latitude, g.longitude, g.created_at,
+                   o.name AS org_name
+            FROM gateways g
+            LEFT JOIN organizations o ON g.org_id = o.id
+            ORDER BY g.gateway_id
+        """)
+    else:
+        if user_org:
+            cur.execute("""
+                SELECT gateway_id, org_id, location_name, latitude, longitude, created_at
+                FROM gateways WHERE org_id = %s ORDER BY gateway_id
+            """, (user_org,))
+        else:
+            cur.execute("SELECT gateway_id, org_id, location_name, latitude, longitude, created_at FROM gateways WHERE 1=0")
+    gateways = cur.fetchall()
+
+    # 3) Nodes — latest reading per node (optimized single JOIN)
+    if is_admin:
+        cur.execute("""
+            SELECT s.node_id, s.gateway_id,
+                   s.temperature, s.humidity, s.flame, s.smoke,
+                   s.latitude, s.longitude, s.rssi, s.snr,
+                   s.timestamp, s.local_timestamp, s.ai_prediction, s.confidence
+            FROM sensor_readings s
+            INNER JOIN (
+                SELECT node_id, MAX(id) AS max_id FROM sensor_readings GROUP BY node_id
+            ) latest ON s.id = latest.max_id
+            ORDER BY s.node_id
+        """)
+    else:
+        if user_org:
+            cur.execute("""
+                SELECT s.node_id, s.gateway_id,
+                       s.temperature, s.humidity, s.flame, s.smoke,
+                       s.latitude, s.longitude, s.rssi, s.snr,
+                       s.timestamp, s.local_timestamp, s.ai_prediction, s.confidence
+                FROM sensor_readings s
+                INNER JOIN (
+                    SELECT node_id, MAX(id) AS max_id FROM sensor_readings GROUP BY node_id
+                ) latest ON s.id = latest.max_id
+                INNER JOIN gateways g ON g.gateway_id = s.gateway_id
+                WHERE g.org_id = %s
+                ORDER BY s.node_id
+            """, (user_org,))
+        else:
+            cur.execute("SELECT node_id FROM sensor_readings WHERE 1=0")
+    raw_nodes = cur.fetchall()
+
+    # 4) Active incidents
+    if is_admin:
+        cur.execute("""
+            SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
+                   fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
+                   fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
+                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type,
+                   CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            WHERE fi.status = 'active'
+            ORDER BY fi.last_updated_at DESC LIMIT 50
+        """)
+    else:
+        if user_org:
+            cur.execute("""
+                SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
+                       fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
+                       fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
+                       fi.assigned_team, fi.dispatch_time, fi.vehicle_type,
+                       CONCAT('Node ', fi.node_id) AS location_name
+                FROM fire_incidents fi
+                INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
+                WHERE fi.status = 'active' AND g.org_id = %s
+                ORDER BY fi.last_updated_at DESC LIMIT 50
+            """, (user_org,))
+        else:
+            cur.execute("SELECT id FROM fire_incidents WHERE 1=0")
+    raw_incidents = cur.fetchall()
+
+    cur.close(); conn.close()
+
+    # Format nodes
+    nodes = []
+    for row in raw_nodes:
+        row_copy = dict(row)
+        row_copy["display_timestamp"] = convert_to_ph_time(row_copy["timestamp"]) if row_copy.get("timestamp") else "N/A"
+        nodes.append(row_copy)
+
+    # Format incidents
+    incidents = []
+    for row in raw_incidents:
+        pred = (row["ai_prediction"] or "").lower()
+        conf = float(row["confidence"]) if row["confidence"] is not None else 0.0
+        conf_pct = conf if conf <= 1.0 else conf / 100.0
+        incidents.append({
+            "incident_id":    row["incident_id"],
+            "node_id":        row["node_id"],
+            "location_name":  row["location_name"],
+            "latitude":       row["latitude"],
+            "longitude":      row["longitude"],
+            "ai_prediction":  row["ai_prediction"],
+            "confidence":     conf_pct,
+            "confidence_pct": round(conf_pct * 100, 1),
+            "status":         "Active" if pred == "fire" else "Possible Fire",
+            "status_class":   "txt-active" if pred == "fire" else "txt-contained",
+            "temperature":    row["temperature"],
+            "humidity":       row["humidity"],
+            "smoke":          row["smoke"],
+            "flame":          row["flame"],
+            "timestamp":      format_local_timestamp(row["last_updated_at"]),
+            "started_at":     format_local_timestamp(row["started_at"]),
+            "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
+            "resolved_at":    None,
+            "assigned_team":  row["assigned_team"],
+            "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
+            "vehicle_type":   row.get("vehicle_type"),
+        })
+
+    # Format user
+    me = None
+    if full_user:
+        me = {
+            "user_id":           full_user["id"],
+            "username":          full_user["username"],
+            "email":             full_user.get("email"),
+            "created_at":        full_user["created_at"].isoformat() if full_user["created_at"] else None,
+            "is_admin":          bool(full_user["is_admin"]),
+            "organization_id":   full_user["org_id"],
+            "organization_name": full_user["organization_name"] or "—",
+        }
+
+    return {
+        "me":        me,
+        "gateways":  gateways,
+        "nodes":     nodes,
+        "incidents": incidents,
+    }
+
 #-----API ENDPOINTS END HERE----------------
 
 #---DELETION----
 @app.delete("/users/{user_id}")
 async def delete_user(user_id: int, current_user: dict = Depends(admin_required)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
     if cur.rowcount == 0:
@@ -690,7 +888,7 @@ async def delete_user(user_id: int, current_user: dict = Depends(admin_required)
 
 @app.delete("/gateways/{gateway_id}")
 async def delete_gateway(gateway_id: str, current_user: dict = Depends(admin_required)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM gateways WHERE gateway_id = %s", (gateway_id,))
     if cur.rowcount == 0:
@@ -702,7 +900,7 @@ async def delete_gateway(gateway_id: str, current_user: dict = Depends(admin_req
 
 @app.delete("/invite-codes/{code}")
 async def delete_invite_code(code: str, current_user: dict = Depends(admin_required)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM invite_codes WHERE code = %s", (code,))
     if cur.rowcount == 0:
@@ -714,7 +912,7 @@ async def delete_invite_code(code: str, current_user: dict = Depends(admin_requi
 
 @app.delete("/organizations/{org_id}")
 async def delete_organization(org_id: int, current_user: dict = Depends(admin_required)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM users WHERE org_id = %s", (org_id,))
     if cur.fetchone()[0] > 0:
@@ -768,7 +966,7 @@ async def get_tomtom_tile_key(current_user: dict = Depends(get_current_user)):
 
 @app.get("/incidents/active")
 async def get_active_incidents(current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -879,7 +1077,7 @@ async def get_incident_history(
     current_user: dict = Depends(get_current_user)
 ):
     """Returns both active and resolved incidents for history/audit."""
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -924,7 +1122,7 @@ async def get_resolved_incidents(
     current_user: dict = Depends(get_current_user)
 ):
     """Returns only resolved incidents, most recently resolved first."""
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -997,7 +1195,7 @@ async def get_incident_by_id(
     incident_id: int,
     current_user: dict = Depends(get_current_user)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT fi.*,
@@ -1049,7 +1247,7 @@ async def respond_to_incident(
     current_user: dict = Depends(get_current_user)
 ):
     """Mark an organization as responding to an incident."""
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     cur.execute("SELECT id, node_id, status FROM fire_incidents WHERE id = %s", (incident_id,))
@@ -1111,7 +1309,7 @@ async def resolve_incident(
     current_user: dict = Depends(get_current_user)
 ):
     """Manually resolve an active fire incident."""
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     now_str = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1154,7 +1352,7 @@ async def resolve_incident(
 # ── Pinned Locations ──────────────────────────────────
 @app.get("/me/pins")
 async def get_my_pins(current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT id, name, latitude, longitude, created_at
@@ -1168,7 +1366,7 @@ async def get_my_pins(current_user: dict = Depends(get_current_user)):
 
 @app.post("/me/pins")
 async def add_pin(pin: PinCreate, current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO user_pinned_locations (user_id, name, latitude, longitude)
@@ -1181,7 +1379,7 @@ async def add_pin(pin: PinCreate, current_user: dict = Depends(get_current_user)
 
 @app.delete("/me/pins/{pin_id}")
 async def delete_pin(pin_id: int, current_user: dict = Depends(get_current_user)):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor()
     cur.execute(
         "DELETE FROM user_pinned_locations WHERE id = %s AND user_id = %s",
@@ -1197,7 +1395,7 @@ async def delete_pin(pin_id: int, current_user: dict = Depends(get_current_user)
 # ── Login / Signup ────────────────────────────────────
 @app.post("/signup")
 async def signup(user: UserCreate):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     cur.execute("""
@@ -1251,7 +1449,7 @@ async def signup(user: UserCreate):
 
 @app.post("/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT * FROM users WHERE username = %s", (form_data.username,))
     user = cur.fetchone()
@@ -1271,7 +1469,7 @@ async def register_gateway(
     current_user: dict = Depends(get_current_user),
     _admin: dict = Depends(admin_required)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT id FROM gateways WHERE gateway_id = %s", (gateway.gateway_id,))
     if cur.fetchone():
@@ -1296,7 +1494,7 @@ async def admin_create_invite_code(
     current_user: dict = Depends(get_current_user),
     _admin: dict = Depends(admin_required)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT id, name FROM organizations WHERE id = %s", (invite.org_id,))
     org = cur.fetchone()
@@ -1327,7 +1525,7 @@ async def create_invite_code_for_org(
     current_user: dict = Depends(get_current_user),
     _admin: dict = Depends(admin_required)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("SELECT id, name FROM organizations WHERE id = %s", (org_id,))
     org = cur.fetchone()
@@ -1365,7 +1563,7 @@ async def simulate_fire(
     gateway_id: str = "GW1",
     current_user: dict = Depends(get_current_user)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -1435,7 +1633,7 @@ async def simulate_fire(
     gateway_id: str = "GW1",
     current_user: dict = Depends(get_current_user)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -1506,7 +1704,7 @@ async def simulate_false(
     gateway_id: str = "GW1",
     current_user: dict = Depends(get_current_user)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -1577,7 +1775,7 @@ async def simulate_normal(
     gateway_id: str = "GW1",
     current_user: dict = Depends(get_current_user)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
@@ -1641,7 +1839,7 @@ async def simulate_normal(
     gateway_id: str = "GW1",
     current_user: dict = Depends(get_current_user)
 ):
-    conn = mysql.connector.connect(**DB_CONFIG)
+    conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
     is_admin = current_user.get('is_admin') == 1
