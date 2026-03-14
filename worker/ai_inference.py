@@ -55,6 +55,17 @@ def on_message(client, userdata, msg):
         s   = payload.get("smoke", 0)
         lat = payload.get("lat")
         lon = payload.get("lon")
+
+        # ── GPS fix detection ──
+        # GPS not yet locked sends 0.0/0.0 or omits lat/lon entirely.
+        # Treat 0,0 as no fix. Store NULL so dashboard shows indicator.
+        gps_fixed = bool(
+            lat is not None and lon is not None and
+            not (float(lat) == 0.0 and float(lon) == 0.0)
+        )
+        if not gps_fixed:
+            lat = None
+            lon = None
         rssi        = data.get("rssi")
         snr         = data.get("snr")
         ts_final    = data.get("received_at", datetime.utcnow().isoformat())
@@ -193,6 +204,9 @@ def on_message(client, userdata, msg):
                 "rssi":          rssi,
                 "temp_delta":    round(t_delta, 2),
                 "manual_fire":   manual_fire,
+                "gps_fixed":     gps_fixed,
+                "latitude":      lat,
+                "longitude":     lon,
             },
             timeout=2
         )

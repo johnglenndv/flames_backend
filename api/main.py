@@ -363,7 +363,7 @@ def upsert_fire_incident(cur, reading: dict):
         return
 
     cur.execute("""
-        SELECT id, trigger_source FROM fire_incidents
+        SELECT id, trigger_source, latitude, longitude FROM fire_incidents
         WHERE node_id = %s AND status = 'active'
         LIMIT 1
     """, (node_id,))
@@ -374,6 +374,12 @@ def upsert_fire_incident(cur, reading: dict):
         keep_trigger = existing.get("trigger_source") or trigger_source
         if trigger_source == "manual":
             keep_trigger = "manual"
+        # Preserve last known good GPS — only overwrite if new reading has valid coords.
+        # This prevents a momentary GPS loss from erasing the incident location in the DB.
+        _new_lat = reading.get("latitude")
+        _new_lon = reading.get("longitude")
+        _lat_update = _new_lat if _new_lat is not None else existing.get("latitude")
+        _lon_update = _new_lon if _new_lon is not None else existing.get("longitude")
         cur.execute("""
             UPDATE fire_incidents SET
                 ai_prediction   = %s,
@@ -394,8 +400,8 @@ def upsert_fire_incident(cur, reading: dict):
             reading.get("humidity"),
             reading.get("flame"),
             reading.get("smoke"),
-            reading.get("latitude"),
-            reading.get("longitude"),
+            _lat_update,
+            _lon_update,
             now_str,
             keep_trigger,
             existing["id"],
