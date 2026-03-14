@@ -886,6 +886,42 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
         "nodes":     nodes,
         "incidents": incidents,
     }
+    
+@app.get("/nodes/{node_id}/last-gps")
+async def get_node_last_gps(
+    node_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Returns the most recent reading for node_id that has non-null,
+    non-zero latitude and longitude.
+    Used by the dashboard when a fire reading has no GPS so it can
+    still show the node's real last known position.
+    """
+    conn = get_db_conn()
+    cur  = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT latitude, longitude, local_timestamp, timestamp
+        FROM sensor_readings
+        WHERE node_id = %s
+          AND latitude  IS NOT NULL AND latitude  != 0
+          AND longitude IS NOT NULL AND longitude != 0
+        ORDER BY id DESC
+        LIMIT 1
+    """, (node_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+ 
+    if not row:
+        return {"found": False}
+ 
+    return {
+        "found":     True,
+        "latitude":  row["latitude"],
+        "longitude": row["longitude"],
+        "saved_at":  format_local_timestamp(row["local_timestamp"] or row["timestamp"]),
+    }
 
 #-----API ENDPOINTS END HERE----------------
 
