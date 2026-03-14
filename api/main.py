@@ -1607,6 +1607,17 @@ async def create_invite_code_for_org(
 @app.post("/notify-new-data")
 async def notify_new_data(data: dict):
     # ── 1. Derive trigger_source ───────────────────────────────────────────────
+    if "node_id" not in data and "node" in data:
+        data["node_id"] = data["node"]
+    if "latitude" not in data and "lat" in data:
+        data["latitude"] = data["lat"]
+    if "longitude" not in data and "lon" in data:
+        data["longitude"] = data["lon"]
+    if "temperature" not in data and "temp" in data:
+        data["temperature"] = data["temp"]
+    if "humidity" not in data and "hum" in data:
+        data["humidity"] = data["hum"]
+
     if "trigger_source" not in data:
         data["trigger_source"] = "manual" if data.get("manual_fire") else "ai"
 
