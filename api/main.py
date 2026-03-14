@@ -351,6 +351,8 @@ def upsert_fire_incident(cur, reading: dict):
     gateway_id = reading.get("gateway_id")
     now_str    = reading.get("local_timestamp") or \
                  datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    # 'manual' if triggered by physical button, 'ai' otherwise
+    trigger_source = "manual" if reading.get("manual_fire") else "ai"
 
     if pred not in ("fire", "false"):
         cur.execute("""
@@ -361,13 +363,17 @@ def upsert_fire_incident(cur, reading: dict):
         return
 
     cur.execute("""
-        SELECT id FROM fire_incidents
+        SELECT id, trigger_source FROM fire_incidents
         WHERE node_id = %s AND status = 'active'
         LIMIT 1
     """, (node_id,))
     existing = cur.fetchone()
 
     if existing:
+        # Once flagged as 'manual', keep that designation for the lifetime of the incident
+        keep_trigger = existing.get("trigger_source") or trigger_source
+        if trigger_source == "manual":
+            keep_trigger = "manual"
         cur.execute("""
             UPDATE fire_incidents SET
                 ai_prediction   = %s,
@@ -378,7 +384,8 @@ def upsert_fire_incident(cur, reading: dict):
                 smoke           = %s,
                 latitude        = %s,
                 longitude       = %s,
-                last_updated_at = %s
+                last_updated_at = %s,
+                trigger_source  = %s
             WHERE id = %s
         """, (
             pred,
@@ -390,6 +397,7 @@ def upsert_fire_incident(cur, reading: dict):
             reading.get("latitude"),
             reading.get("longitude"),
             now_str,
+            keep_trigger,
             existing["id"],
         ))
     else:
@@ -397,12 +405,11 @@ def upsert_fire_incident(cur, reading: dict):
             INSERT INTO fire_incidents
                 (node_id, gateway_id, ai_prediction, confidence,
                  temperature, humidity, flame, smoke,
-                 latitude, longitude, status, started_at, last_updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s)
+                 latitude, longitude, status, started_at, last_updated_at,
+                 trigger_source)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'active',%s,%s,%s)
         """, (
-            node_id,
-            gateway_id,
-            pred,
+            node_id, gateway_id, pred,
             reading.get("confidence", 0),
             reading.get("temperature"),
             reading.get("humidity"),
@@ -410,8 +417,8 @@ def upsert_fire_incident(cur, reading: dict):
             reading.get("smoke"),
             reading.get("latitude"),
             reading.get("longitude"),
-            now_str,
-            now_str,
+            now_str, now_str,
+            trigger_source,
         ))
 
 #----WEBSOCKET ENDPOINTS START HERE----------------
@@ -789,7 +796,7 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
                    fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
                    fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
-                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type,
+                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
                    CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             WHERE fi.status = 'active'
@@ -801,7 +808,7 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
                 SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
                        fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
                        fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
-                       fi.assigned_team, fi.dispatch_time, fi.vehicle_type,
+                       fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
                        CONCAT('Node ', fi.node_id) AS location_name
                 FROM fire_incidents fi
                 INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
@@ -849,6 +856,7 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             "assigned_team":  row["assigned_team"],
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
+            "trigger_source": row.get("trigger_source", "ai"),
         })
 
     # Format user
@@ -991,6 +999,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 fi.assigned_team,
                 fi.dispatch_time,
                 fi.vehicle_type,
+                fi.trigger_source,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             WHERE fi.status = 'active'
@@ -1019,6 +1028,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 fi.assigned_team,
                 fi.dispatch_time,
                 fi.vehicle_type,
+                fi.trigger_source,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
@@ -1067,6 +1077,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "assigned_team":  row["assigned_team"],
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
+            "trigger_source": row.get("trigger_source", "ai"),
         })
     return incidents
 
@@ -1185,6 +1196,7 @@ async def get_resolved_incidents(
             "assigned_team":  row.get("assigned_team"),
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
+            "trigger_source": row.get("trigger_source", "ai"),
         })
     return result
 
@@ -1237,6 +1249,7 @@ async def get_incident_by_id(
         "started_at":     format_local_timestamp(row.get("started_at")),
         "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
         "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
+        "trigger_source": row.get("trigger_source", "ai"),
     }
 
 
@@ -1549,6 +1562,9 @@ async def create_invite_code_for_org(
 
 @app.post("/notify-new-data")
 async def notify_new_data(data: dict):
+    # Derive trigger_source from manual_fire flag so dashboard can display the badge
+    if "trigger_source" not in data:
+        data["trigger_source"] = "manual" if data.get("manual_fire") else "ai"
     await manager.broadcast(data)
     return {"status": "broadcasted"}
 
