@@ -62,13 +62,16 @@ def on_message(client, userdata, msg):
             print(f"  🚨 MANUAL FIRE BUTTON pressed on {node} — bypassing AI")
 
         # REAL-TIME TEMPORAL ENGINEERING
-        prev = node_history.get(node, {'t': t, 's': s, 'f': f, 'h': h})
+        prev = node_history.get(node, {'t': t, 's': s, 'f': f, 'h': h, 'manual_fire_active': False})
 
         t_delta, s_delta = t - prev['t'], s - prev['s']
         f_delta, h_delta = f - prev['f'], h - prev['h']
         t_roll, s_roll = (t + prev['t']) / 2, (s + prev['s']) / 2
 
-        node_history[node] = {'t': t, 's': s, 'f': f, 'h': h}
+        node_history[node] = {
+            't': t, 's': s, 'f': f, 'h': h,
+            'manual_fire_active': node_history.get(node, {}).get('manual_fire_active', False)
+        }
 
         # AI INFERENCE
         features = [s, t, f, h, t_delta, s_delta, f_delta, h_delta, t_roll, s_roll]
@@ -83,16 +86,30 @@ def on_message(client, userdata, msg):
         final_label = class_names[np.argmax(probs)]
         confidence = float(np.max(probs))
 
-        # HOT DAY OVERRIDE (Safety Filter)
-        if final_label.lower() in ["fire", "false"]:
-            if abs(t_delta) < 0.2 and s < 30:
-                final_label, confidence = "Normal", 0.98
-
-        # ── MANUAL FIRE OVERRIDE — always wins, bypasses AI + safety filter ──
+        # ── MANUAL FIRE OVERRIDE — check FIRST, bypasses AI + safety filter ──
         if manual_fire:
             final_label = "fire"
             confidence  = 1.0
+            node_history[node]['manual_fire_active'] = True  # Lock incident open
             print(f"  ✅ Manual fire override applied: label=fire, confidence=1.0")
+        else:
+            # HOT DAY OVERRIDE (Safety Filter) — only runs if NOT a manual fire
+            if final_label.lower() in ["fire", "false"]:
+                if abs(t_delta) < 0.2 and s < 30:
+                    # Don't resolve if manual fire incident is still active
+                    if not node_history.get(node, {}).get('manual_fire_active', False):
+                        final_label, confidence = "Normal", 0.98
+
+            # Only clear manual_fire_active lock if sensors confirm sustained all-clear
+            if node_history.get(node, {}).get('manual_fire_active', False):
+                if final_label.lower() == "normal" and f == 0 and s < 20 and t < 40:
+                    node_history[node]['manual_fire_active'] = False
+                    print(f"  ✅ Manual fire lock released for {node} — sensors confirm normal")
+                else:
+                    # Keep fire label active while lock is on
+                    final_label = "fire"
+                    confidence  = 1.0
+                    print(f"  🔒 Manual fire lock still active for {node}")
 
         # DATABASE INSERT
         conn = mysql.connector.connect(**DB_CONFIG)
