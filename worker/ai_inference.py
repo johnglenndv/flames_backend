@@ -219,6 +219,8 @@ def on_message(client, userdata, msg):
                 "humidity":      h,
                 "smoke":         s,
                 "flame":         f,
+                "latitude":      lat,
+                "longitude":     lon,
                 "rssi":          rssi,
                 "temp_delta":    round(t_delta, 2),
                 "manual_fire":   manual_fire,
