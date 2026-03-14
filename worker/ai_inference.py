@@ -1,3 +1,4 @@
+from api.main import PH_ZONE
 import os, json, joblib, requests
 import pandas as pd
 import numpy as np
@@ -57,12 +58,23 @@ def on_message(client, userdata, msg):
         lon = payload.get("lon")
         rssi        = data.get("rssi")
         snr         = data.get("snr")
-        ts_final    = data.get("received_at", datetime.utcnow().isoformat())
-        ts_early    = data.get("received_at_early", ts_final)
+        
+        # ts_final = UTC timestamp (for the timestamp column)
+        ts_final = data.get("received_at", datetime.utcnow().isoformat())
 
-        # ── Manual fire flag — set by physical button on device ──
-        # This flag alone is enough to trigger fire alert.
-        # Real sensor values are stored in DB regardless.
+        # ts_early = PH local time (UTC+8) for the local_timestamp column
+        #   Convert UTC received_at to PH time
+        try:
+            _utc_dt = datetime.fromisoformat(ts_final.replace('Z', '+00:00'))
+            _ph_dt  = _utc_dt.astimezone(PH_ZONE)
+            ts_early = _ph_dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            # Fallback: use current PH time
+            ts_early = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+
+                # ── Manual fire flag — set by physical button on device ──
+                #      This flag alone is enough to trigger fire alert.
+                # Real sensor values are stored in DB regardless.
         manual_fire = payload.get("manual_fire", False)
 
         # ── Temporal feature engineering ──
