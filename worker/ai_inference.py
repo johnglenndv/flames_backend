@@ -1,10 +1,13 @@
-from api.main import PH_ZONE
+
+from zoneinfo import ZoneInfo
 import os, json, joblib, requests
 import pandas as pd
 import numpy as np
 import paho.mqtt.client as mqtt
 import mysql.connector
 from datetime import datetime
+
+PH_ZONE = ZoneInfo("Asia/Manila")
 
 # --- 1. CONFIG & ASSETS ---
 try:
