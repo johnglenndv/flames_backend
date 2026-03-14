@@ -1394,6 +1394,8 @@ async def resolve_incident(
         WHERE id = %s
     """, (now_str, body.notes, incident_id))
     conn.commit()
+    # Immediately clean up traffic state so resolved incident disappears from all devices
+    _shared_traffic.pop(f'incident_{incident_id}', None)
     cur.close(); conn.close()
 
     # Broadcast incident resolved — includes node_id and action so all clients
