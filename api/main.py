@@ -57,7 +57,7 @@ def _set_traffic(key: str, data: dict):
 import httpx as _httpx
 from contextlib import asynccontextmanager
 
-TOMTOM_KEY       = 'lOWQDi4zApH4e7ErhUadSnRFHgYLg05X'
+TOMTOM_KEY       = 'iy3ljq06nVjJYIdgJdqJZAHiDaYPattE'
 TOMTOM_FLOW_BASE = 'https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json'
 TRAFFIC_INTERVAL = 300  # seconds — same 5-min interval as frontend
 
