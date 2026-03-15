@@ -1,4 +1,3 @@
-
 from zoneinfo import ZoneInfo
 import os, json, joblib, requests
 import pandas as pd
@@ -52,7 +51,6 @@ def on_message(client, userdata, msg):
         node       = payload.get("node")
         if not node: return
 
-        # ── Raw sensor data — always real values from device ──
         t   = payload.get("temp")
         h   = payload.get("hum")
         f   = payload.get("flame", 0)
@@ -61,24 +59,16 @@ def on_message(client, userdata, msg):
         lon = payload.get("lon")
         rssi        = data.get("rssi")
         snr         = data.get("snr")
+        manual_fire = payload.get("manual_fire", False)
         
-        # ts_final = UTC timestamp (for the timestamp column)
         ts_final = data.get("received_at", datetime.utcnow().isoformat())
 
-        # ts_early = PH local time (UTC+8) for the local_timestamp column
-        #   Convert UTC received_at to PH time
         try:
             _utc_dt = datetime.fromisoformat(ts_final.replace('Z', '+00:00'))
             _ph_dt  = _utc_dt.astimezone(PH_ZONE)
             ts_early = _ph_dt.strftime("%Y-%m-%d %H:%M:%S")
         except Exception:
-            # Fallback: use current PH time
             ts_early = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
-
-                # ── Manual fire flag — set by physical button on device ──
-                #      This flag alone is enough to trigger fire alert.
-                # Real sensor values are stored in DB regardless.
-        manual_fire = payload.get("manual_fire", False)
 
         # ── Temporal feature engineering ──
         prev = node_history.get(node, {
@@ -93,13 +83,7 @@ def on_message(client, userdata, msg):
         t_roll  = (t + prev['t']) / 2
         s_roll  = (s + prev['s']) / 2
 
-        # Update history with real values
-        node_history[node] = {
-            't': t, 's': s, 'f': f, 'h': h,
-            'manual_fire_active': prev.get('manual_fire_active', False)
-        }
-
-        # ── AI inference on REAL sensor values ──
+        # ── AI inference ──
         features = [s, t, f, h, t_delta, s_delta, f_delta, h_delta, t_roll, s_roll]
         input_df = pd.DataFrame([features], columns=[
             'smoke', 'temperature', 'flame', 'humidity',
@@ -111,95 +95,68 @@ def on_message(client, userdata, msg):
         ai_label     = class_names[np.argmax(probs)]
         ai_confidence = float(np.max(probs))
 
-        # ── Decision logic ──
-        #
-        # Priority order:
-        # 1. manual_fire=true  → always fire, confidence 1.0, lock node
-        # 2. manual_fire=false + lock active → keep fire until sensors clear
-        # 3. normal AI result  → use AI with safety filter
-        #
+        # ── DECISION LOGIC & SOURCE TRACKING ──
         final_label = ai_label
         confidence  = ai_confidence
+        trigger_source = "ai" # Default source
 
         if manual_fire:
-            # ── CASE 1: Button pressed on device ──
-            # Force fire regardless of AI or sensor readings.
-            # Real sensor values are still stored in DB for audit.
             final_label = "fire"
             confidence  = 1.0
-            node_history[node]['manual_fire_active'] = True
-            print(f"  🚨 [{node}] MANUAL FIRE BUTTON — label forced to fire")
+            trigger_source = "manual"
+            node_history[node] = {
+                't': t, 's': s, 'f': f, 'h': h,
+                'manual_fire_active': True
+            }
+            print(f"  🚨 [{node}] MANUAL FIRE BUTTON ACTIVE")
 
         elif prev.get('manual_fire_active', False):
-            # ── CASE 2: Button was pressed in a previous reading ──
-            # Keep fire label active until sensors confirm all-clear.
-            # This prevents the incident from auto-resolving on the
-            # next 60s reading just because the button is no longer held.
-            sensors_all_clear = (
-                ai_label.lower() == "normal" and
-                f == 0 and
-                s < 20 and
-                t < 40
-            )
+            sensors_all_clear = (ai_label.lower() == "normal" and f == 0 and s < 20 and t < 40)
             if sensors_all_clear:
-                # Sensors genuinely clear — release the lock
-                node_history[node]['manual_fire_active'] = False
-                final_label = "Normal"
-                confidence  = ai_confidence
-                print(f"  ✅ [{node}] Manual fire lock released — sensors confirm normal")
+                node_history[node] = {
+                    't': t, 's': s, 'f': f, 'h': h,
+                    'manual_fire_active': False
+                }
+                trigger_source = "ai"
+                print(f"  ✅ [{node}] Manual fire lock released")
             else:
-                # Lock still holds — keep fire label
                 final_label = "fire"
                 confidence  = 1.0
-                print(f"  🔒 [{node}] Manual fire lock active — keeping fire label")
-
+                trigger_source = "manual_lock"
+                node_history[node].update({'t': t, 's': s, 'f': f, 'h': h})
+                print(f"  🔒 [{node}] Manual lock active (keeping fire label)")
         else:
-    # ── CASE 3: Normal AI path ──
-    # Apply safety filter only when no manual override involved
+            # Safety filter logic
+            node_history[node] = {
+                't': t, 's': s, 'f': f, 'h': h,
+                'manual_fire_active': False
+            }
             if final_label.lower() in ["fire", "false"]:
-                # A real fire needs MULTIPLE sensor agreement — not just flame alone.
-                # Flame sensor alone (high f, low smoke, normal temp) is almost always
-                # ambient IR / sunlight interference.
-                smoke_is_low   = s < 50
-                temp_is_normal = t < 40
-                temp_stable    = abs(t_delta) < 1.0
-                no_smoke_rise  = s_delta < 20
-                # Flame-only false positive: high flame reading but no smoke, normal temp
-                flame_only_trigger = f > 0 and smoke_is_low and temp_is_normal
-
-                if flame_only_trigger and temp_stable and no_smoke_rise:
-                    final_label = "Normal"
-                    confidence  = 0.97
-                    print(f"  🌡  [{node}] Safety filter: flame-only trigger, no smoke/temp rise → Normal")
-                elif abs(t_delta) < 0.2 and s < 30:
+                if (f > 0 and s < 50 and t < 40 and abs(t_delta) < 1.0) or (abs(t_delta) < 0.2 and s < 30):
                     final_label = "Normal"
                     confidence  = 0.98
-                    print(f"  🌡  [{node}] Safety filter: stable temp + low smoke → Normal")
 
-        print(f"  [{node}] AI={ai_label}({ai_confidence*100:.1f}%) "
-              f"→ Final={final_label}({confidence*100:.1f}%) "
-              f"| T={t} H={h} Flame={f} Smoke={s}"
-              f"{' [MANUAL BUTTON]' if manual_fire else ''}")
-
-        # ── Database insert — always stores REAL sensor values ──
+        # ── Database insert ──
         conn = mysql.connector.connect(**DB_CONFIG)
         ensure_gateway_exists(conn, gateway_id)
         cur = conn.cursor()
+        
+        # Added 'trigger_source' column and one extra %s (total 21 columns)
         sql = """
             INSERT INTO sensor_readings
             (gateway_id, node_id, timestamp, local_timestamp,
              temperature, humidity, flame, smoke,
              latitude, longitude, rssi, snr,
-             ai_prediction, confidence,
+             ai_prediction, confidence, trigger_source,
              temp_delta, smoke_delta, flame_delta, hum_delta,
              temp_roll_avg, smoke_roll_avg)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """
         cur.execute(sql, (
             gateway_id, node, ts_final, ts_early,
-            t, h, f, s,              # real sensor values
+            t, h, f, s,
             lat, lon, rssi, snr,
-            final_label, confidence, # overridden label if manual
+            final_label, confidence, trigger_source, # <--- Added here
             t_delta, s_delta, f_delta, h_delta,
             t_roll, s_roll
         ))
@@ -215,6 +172,7 @@ def on_message(client, userdata, msg):
                 "node_id":       node,
                 "ai_prediction": final_label,
                 "confidence":    f"{confidence*100:.2f}%",
+                "trigger_source": trigger_source, # <--- New field for Dashboard
                 "temperature":   t,
                 "humidity":      h,
                 "smoke":         s,
