@@ -375,7 +375,7 @@ def upsert_fire_incident(cur, reading: dict):
     now_str    = reading.get("local_timestamp") or \
                  datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
     # 'manual' if triggered by physical button, 'ai' otherwise
-    trigger_source = "manual" if reading.get("manual_fire") else "ai"
+    trigger_source = reading.get("trigger_source") or ("manual" if reading.get("manual_fire") else "ai")
 
     if pred not in ("fire", "false"):
         cur.execute("""
