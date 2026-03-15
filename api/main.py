@@ -112,8 +112,28 @@ async def _traffic_background_task():
                 inc_id = row['id']
                 lat    = row.get('latitude')
                 lng    = row.get('longitude')
+
+                # If incident has no coords, try to get last known GPS from sensor_readings
                 if not lat or not lng:
-                    continue
+                    try:
+                        cur2 = conn.cursor(dictionary=True)
+                        cur2.execute("""
+                            SELECT latitude, longitude FROM sensor_readings
+                            WHERE node_id = %s
+                            AND latitude IS NOT NULL AND latitude != 0
+                            AND longitude IS NOT NULL AND longitude != 0
+                            ORDER BY id DESC LIMIT 1
+                        """, (row['node_id'],))
+                        gps_row = cur2.fetchone()
+                        cur2.close()
+                        if gps_row:
+                            lat = gps_row['latitude']
+                            lng = gps_row['longitude']
+                    except Exception:
+                        pass
+
+                if not lat or not lng:
+                    continue  # truly no GPS anywhere — skip
                 active_ids.add(inc_id)
                 now_ms = int(time.time() * 1000)
                 # Check in-memory fetch state first, then fall back to _shared_traffic
