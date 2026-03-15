@@ -111,7 +111,7 @@ def on_message(client, userdata, msg):
             print(f"  🚨 [{node}] MANUAL FIRE BUTTON ACTIVE")
 
         elif prev.get('manual_fire_active', False):
-            sensors_all_clear = (ai_label.lower() == "normal" and f == 0 and s < 20 and t < 40)
+            sensors_all_clear = (ai_label.lower() == "normal" and s < 20 and t < 40)
             if sensors_all_clear:
                 node_history[node] = {
                     't': t, 's': s, 'f': f, 'h': h,
