@@ -94,14 +94,13 @@ async def _server_fetch_traffic(coords: list, n: int = 10):
 
 async def _traffic_background_task():
     import time
-    await asyncio.sleep(5)  # wait for app to fully start
-    # Per-incident fetch state: { incident_id: last_fetch_ms }
+    await asyncio.sleep(5)
     _incident_fetch_state: dict = {}
     while True:
         try:
             conn = get_db_conn()
             cur  = conn.cursor(dictionary=True)
-            cur.execute("SELECT id, latitude, longitude FROM fire_incidents WHERE status='active'")
+            cur.execute("SELECT id, node_id, latitude, longitude FROM fire_incidents WHERE status='active'")
             rows = cur.fetchall()
             cur.close(); conn.close()
 
@@ -113,34 +112,33 @@ async def _traffic_background_task():
                 lat    = row.get('latitude')
                 lng    = row.get('longitude')
 
-                # If incident has no coords, try to get last known GPS from sensor_readings
+                # GPS fallback — separate connection to avoid cursor conflict
                 if not lat or not lng:
                     try:
-                        cur2 = conn.cursor(dictionary=True)
+                        conn2 = get_db_conn()
+                        cur2  = conn2.cursor(dictionary=True)
                         cur2.execute("""
                             SELECT latitude, longitude FROM sensor_readings
                             WHERE node_id = %s
-                            AND latitude IS NOT NULL AND latitude != 0
-                            AND longitude IS NOT NULL AND longitude != 0
+                              AND latitude  IS NOT NULL AND latitude  != 0
+                              AND longitude IS NOT NULL AND longitude != 0
                             ORDER BY id DESC LIMIT 1
                         """, (row['node_id'],))
                         gps_row = cur2.fetchone()
-                        cur2.close()
+                        cur2.close(); conn2.close()
                         if gps_row:
                             lat = gps_row['latitude']
                             lng = gps_row['longitude']
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f'[FLAMES] GPS fallback error: {e}')
 
                 if not lat or not lng:
-                    continue  # truly no GPS anywhere — skip
+                    continue
+
                 active_ids.add(inc_id)
                 now_ms = int(time.time() * 1000)
-                # Check in-memory fetch state first, then fall back to _shared_traffic
-                # This prevents re-fetching after server restart if data is still fresh
                 last_fetch = _incident_fetch_state.get(inc_id, 0)
                 if not last_fetch:
-                    # Check if we already have fresh data in shared state from before restart
                     existing = _shared_traffic.get(f'incident_{inc_id}')
                     if existing and existing.get('fetchedAt'):
                         last_fetch = existing['fetchedAt']
@@ -148,18 +146,16 @@ async def _traffic_background_task():
 
                 age_ms = now_ms - last_fetch
 
-                # Only fetch if we have no data at all, or data is older than 5 minutes
                 if age_ms >= TRAFFIC_INTERVAL * 1000:
                     traffic = await _server_fetch_traffic([[float(lat), float(lng)]])
                     if traffic:
-                        fetch_ms = int(time.time() * 1000)  # timestamp AFTER fetch completes
+                        fetch_ms = int(time.time() * 1000)
                         traffic['fetchedAt'] = fetch_ms
                         traffic['incidentId'] = inc_id
                         _set_traffic(f'incident_{inc_id}', traffic)
                         _incident_fetch_state[inc_id] = fetch_ms
                         broadcast_needed = True
 
-            # Remove resolved incidents from fetch state
             resolved_ids = set(_incident_fetch_state.keys()) - active_ids
             for inc_id in resolved_ids:
                 del _incident_fetch_state[inc_id]
