@@ -11,6 +11,10 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 import secrets, string
 from typing import List, Optional
+# Fix bcrypt/passlib version mismatch on Python 3.13
+import bcrypt as _bcrypt_fix
+if not hasattr(_bcrypt_fix, '__about__'):
+    _bcrypt_fix.__about__ = type('_', (), {'__version__': _bcrypt_fix.__version__})()
 
 #-------WEBSOCKET MANAGER START HERE----------------
 import asyncio
