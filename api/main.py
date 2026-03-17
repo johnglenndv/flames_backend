@@ -1094,6 +1094,12 @@ async def assign_node_to_user(
     """, (user_id, body.node_id, _admin["id"]))
     conn.commit()
     cur.close(); conn.close()
+    await manager.broadcast({
+        "type": "node_assignment_update",
+        "user_id": user_id,
+        "node_id": body.node_id,
+        "action": "assigned"
+    })
     return {"message": f"Node '{body.node_id}' assigned to user '{user['username']}'"}
 
 
@@ -1115,6 +1121,12 @@ async def remove_node_from_user(
         raise HTTPException(404, "Assignment not found")
     conn.commit()
     cur.close(); conn.close()
+    await manager.broadcast({
+        "type": "node_assignment_update",
+        "user_id": user_id,
+        "node_id": node_id,
+        "action": "removed"
+    })
     return {"message": f"Node '{node_id}' removed from user {user_id}"}
 
 
