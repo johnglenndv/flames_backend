@@ -41,9 +41,6 @@ manager = ConnectionManager()
 #-------WEBSOCKET MANAGER END HERE----------------
 
 #-------SHARED TRAFFIC STATE START HERE----------------
-# In-memory traffic state shared across all devices on this server instance.
-# Survives page refresh and new tabs - everyone gets same traffic age.
-# Key: 'cards' for card ticker, or str(incident_id) for detail route.
 import json as _json
 _shared_traffic: dict = {}
 
@@ -60,7 +57,7 @@ from contextlib import asynccontextmanager
 
 TOMTOM_KEY       = 'iy3ljq06nVjJYIdgJdqJZAHiDaYPattE'
 TOMTOM_FLOW_BASE = 'https://api.tomtom.com/traffic/services/4/flowSegmentData/relative0/10/json'
-TRAFFIC_INTERVAL = 300  # seconds — same 5-min interval as frontend
+TRAFFIC_INTERVAL = 300  # seconds
 
 async def _fetch_flow_point_server(client, lat: float, lng: float):
     try:
@@ -112,7 +109,6 @@ async def _traffic_background_task():
                 lat    = row.get('latitude')
                 lng    = row.get('longitude')
 
-                # GPS fallback — separate connection to avoid cursor conflict
                 if not lat or not lng:
                     try:
                         conn2 = get_db_conn()
@@ -227,9 +223,12 @@ class ResolveIncidentBody(BaseModel):
 class RespondIncidentBody(BaseModel):
     organization_id: int | None = None
     organization_name: str | None = None
-    dispatch_time: str | None = None   # ISO or local string when rescue was dispatched
-    vehicle_type: str | None = None    # e.g. "firetruck", "ambulance"
+    dispatch_time: str | None = None
+    vehicle_type: str | None = None
 
+# ── NEW: for assigning nodes to users ──
+class AssignNodeBody(BaseModel):
+    node_id: str
 #-----DATA MODELS END HERE----------------
 
 
@@ -258,9 +257,6 @@ DB_CONFIG = {
     "database": os.getenv("MYSQLDATABASE"),
 }
 
-# -- Connection Pool ----------------------------------------------------------
-# Reuses existing MySQL connections instead of opening a new one per request.
-# pool_size=10 supports up to 10 simultaneous DB calls without waiting.
 _db_pool = None
 
 def _init_pool():
@@ -278,7 +274,6 @@ def _init_pool():
         _db_pool = None
 
 def get_db_conn():
-    """Get a pooled connection, or direct connection as fallback."""
     if _db_pool:
         return _db_pool.get_connection()
     return mysql.connector.connect(**DB_CONFIG)
@@ -310,16 +305,12 @@ def format_local_timestamp(ts):
         return str(ts)
 
 def ph_local_to_utc_iso(ts):
-    """Convert a PH-local (UTC+8) datetime (naive or string) to a proper UTC ISO string.
-    The DB stores started_at in PH local time. This converts it back to real UTC
-    so all clients compute consistent relative ages regardless of their own timezone."""
     if not ts:
         return None
     try:
         if isinstance(ts, str):
             from datetime import datetime as _dt
             ts = _dt.strptime(ts.replace('T', ' ').split('.')[0][:19], "%Y-%m-%d %H:%M:%S")
-        # ts is naive but represents PH time (UTC+8), so UTC = ts - 8h
         utc_dt = ts - timedelta(hours=8)
         return utc_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception as e:
@@ -374,7 +365,6 @@ def upsert_fire_incident(cur, reading: dict):
     gateway_id = reading.get("gateway_id")
     now_str    = reading.get("local_timestamp") or \
                  datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
-    # 'manual' if triggered by physical button, 'ai' otherwise
     trigger_source = reading.get("trigger_source") or ("manual" if reading.get("manual_fire") else "ai")
 
     if pred not in ("fire", "false"):
@@ -393,7 +383,6 @@ def upsert_fire_incident(cur, reading: dict):
     existing = cur.fetchone()
 
     if existing:
-        # Once flagged as 'manual', keep that designation for the lifetime of the incident
         keep_trigger = existing.get("trigger_source") or trigger_source
         if trigger_source == "manual":
             keep_trigger = "manual"
@@ -451,10 +440,8 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             try:
-                # Wait for client message with 30s timeout, then send ping to keep alive
                 data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
             except asyncio.TimeoutError:
-                # Send ping to keep Railway proxy from killing idle connection
                 try:
                     await websocket.send_json({"type": "ping"})
                 except Exception:
@@ -513,13 +500,10 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
 
-    # Optimized: single JOIN on the latest reading per node (vs 12 correlated subqueries).
-    # Uses a subquery to find max(id) per node, then joins once — much faster.
     if is_admin:
         cur.execute("""
             SELECT
-                s.node_id,
-                s.gateway_id,
+                s.node_id, s.gateway_id,
                 s.temperature, s.humidity, s.flame, s.smoke,
                 s.latitude, s.longitude, s.rssi, s.snr,
                 s.timestamp, s.local_timestamp,
@@ -532,14 +516,11 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
             ) latest ON s.id = latest.max_id
             ORDER BY s.node_id
         """)
-    else:
-        if not user_org:
-            cur.close(); conn.close()
-            return []
+    elif user_org:
+        # Member: sees nodes via their org's gateways
         cur.execute("""
             SELECT
-                s.node_id,
-                s.gateway_id,
+                s.node_id, s.gateway_id,
                 s.temperature, s.humidity, s.flame, s.smoke,
                 s.latitude, s.longitude, s.rssi, s.snr,
                 s.timestamp, s.local_timestamp,
@@ -554,6 +535,25 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
             WHERE g.org_id = %s
             ORDER BY s.node_id
         """, (user_org,))
+    else:
+        # User role: sees only their assigned nodes
+        cur.execute("""
+            SELECT
+                s.node_id, s.gateway_id,
+                s.temperature, s.humidity, s.flame, s.smoke,
+                s.latitude, s.longitude, s.rssi, s.snr,
+                s.timestamp, s.local_timestamp,
+                s.ai_prediction, s.confidence
+            FROM sensor_readings s
+            INNER JOIN (
+                SELECT node_id, MAX(id) AS max_id
+                FROM sensor_readings
+                GROUP BY node_id
+            ) latest ON s.id = latest.max_id
+            INNER JOIN user_nodes un ON un.node_id = s.node_id
+            WHERE un.user_id = %s
+            ORDER BY s.node_id
+        """, (current_user["id"],))
 
     nodes = cur.fetchall()
     cur.close()
@@ -563,8 +563,6 @@ async def get_all_nodes(current_user: dict = Depends(get_current_user)):
     for row in nodes:
         row_copy = row.copy()
         row_copy["display_timestamp"] = convert_to_ph_time(row_copy["timestamp"]) if row_copy.get("timestamp") else "N/A"
-        # Convert raw UTC datetime to ISO string with 'Z' suffix so the dashboard
-        # knows it's UTC — prevents 8-hour offset error in offline detection
         if row_copy.get("timestamp") and not isinstance(row_copy["timestamp"], str):
             row_copy["timestamp"] = row_copy["timestamp"].strftime("%Y-%m-%dT%H:%M:%SZ")
         elif row_copy.get("timestamp") and isinstance(row_copy["timestamp"], str):
@@ -749,12 +747,10 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
         "organization_name": full_user["organization_name"] or "—",
     }
 
-# ── Dashboard Init (consolidates 5 startup requests into 1) ─────────────────
+
+# ── Dashboard Init ─────────────────────────────────────────────
 @app.get("/dashboard-init")
 async def dashboard_init(current_user: dict = Depends(get_current_user)):
-    """Returns everything the dashboard needs on first load in a single request:
-    user info, gateways, nodes (latest reading per node), and active incidents.
-    Reduces startup from ~6 sequential HTTP round-trips to 1."""
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     user_org = current_user.get("org_id")
@@ -786,10 +782,10 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
                 FROM gateways WHERE org_id = %s ORDER BY gateway_id
             """, (user_org,))
         else:
-            cur.execute("SELECT gateway_id, org_id, location_name, latitude, longitude, created_at FROM gateways WHERE 1=0")
+            cur.execute("SELECT gateway_id FROM gateways WHERE 1=0")
     gateways = cur.fetchall()
 
-    # 3) Nodes — latest reading per node (optimized single JOIN)
+    # 3) Nodes — latest reading per node
     if is_admin:
         cur.execute("""
             SELECT s.node_id, s.gateway_id,
@@ -802,23 +798,35 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             ) latest ON s.id = latest.max_id
             ORDER BY s.node_id
         """)
+    elif user_org:
+        cur.execute("""
+            SELECT s.node_id, s.gateway_id,
+                   s.temperature, s.humidity, s.flame, s.smoke,
+                   s.latitude, s.longitude, s.rssi, s.snr,
+                   s.timestamp, s.local_timestamp, s.ai_prediction, s.confidence
+            FROM sensor_readings s
+            INNER JOIN (
+                SELECT node_id, MAX(id) AS max_id FROM sensor_readings GROUP BY node_id
+            ) latest ON s.id = latest.max_id
+            INNER JOIN gateways g ON g.gateway_id = s.gateway_id
+            WHERE g.org_id = %s
+            ORDER BY s.node_id
+        """, (user_org,))
     else:
-        if user_org:
-            cur.execute("""
-                SELECT s.node_id, s.gateway_id,
-                       s.temperature, s.humidity, s.flame, s.smoke,
-                       s.latitude, s.longitude, s.rssi, s.snr,
-                       s.timestamp, s.local_timestamp, s.ai_prediction, s.confidence
-                FROM sensor_readings s
-                INNER JOIN (
-                    SELECT node_id, MAX(id) AS max_id FROM sensor_readings GROUP BY node_id
-                ) latest ON s.id = latest.max_id
-                INNER JOIN gateways g ON g.gateway_id = s.gateway_id
-                WHERE g.org_id = %s
-                ORDER BY s.node_id
-            """, (user_org,))
-        else:
-            cur.execute("SELECT node_id FROM sensor_readings WHERE 1=0")
+        # User role: assigned nodes only
+        cur.execute("""
+            SELECT s.node_id, s.gateway_id,
+                   s.temperature, s.humidity, s.flame, s.smoke,
+                   s.latitude, s.longitude, s.rssi, s.snr,
+                   s.timestamp, s.local_timestamp, s.ai_prediction, s.confidence
+            FROM sensor_readings s
+            INNER JOIN (
+                SELECT node_id, MAX(id) AS max_id FROM sensor_readings GROUP BY node_id
+            ) latest ON s.id = latest.max_id
+            INNER JOIN user_nodes un ON un.node_id = s.node_id
+            WHERE un.user_id = %s
+            ORDER BY s.node_id
+        """, (current_user["id"],))
     raw_nodes = cur.fetchall()
 
     # 4) Active incidents
@@ -833,21 +841,31 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             WHERE fi.status = 'active'
             ORDER BY fi.last_updated_at DESC LIMIT 50
         """)
+    elif user_org:
+        cur.execute("""
+            SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
+                   fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
+                   fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
+                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                   CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
+            WHERE fi.status = 'active' AND g.org_id = %s
+            ORDER BY fi.last_updated_at DESC LIMIT 50
+        """, (user_org,))
     else:
-        if user_org:
-            cur.execute("""
-                SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
-                       fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
-                       fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
-                       fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
-                       CONCAT('Node ', fi.node_id) AS location_name
-                FROM fire_incidents fi
-                INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
-                WHERE fi.status = 'active' AND g.org_id = %s
-                ORDER BY fi.last_updated_at DESC LIMIT 50
-            """, (user_org,))
-        else:
-            cur.execute("SELECT id FROM fire_incidents WHERE 1=0")
+        # User role: incidents on their assigned nodes only
+        cur.execute("""
+            SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
+                   fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
+                   fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
+                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                   CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            INNER JOIN user_nodes un ON un.node_id = fi.node_id
+            WHERE fi.status = 'active' AND un.user_id = %s
+            ORDER BY fi.last_updated_at DESC LIMIT 50
+        """, (current_user["id"],))
     raw_incidents = cur.fetchall()
 
     cur.close(); conn.close()
@@ -909,18 +927,13 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
         "nodes":     nodes,
         "incidents": incidents,
     }
-    
+
+
 @app.get("/nodes/{node_id}/last-gps")
 async def get_node_last_gps(
     node_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Returns the most recent reading for node_id that has non-null,
-    non-zero latitude and longitude.
-    Used by the dashboard when a fire reading has no GPS so it can
-    still show the node's real last known position.
-    """
     conn = get_db_conn()
     cur  = conn.cursor(dictionary=True)
     cur.execute("""
@@ -935,10 +948,10 @@ async def get_node_last_gps(
     row = cur.fetchone()
     cur.close()
     conn.close()
- 
+
     if not row:
         return {"found": False}
- 
+
     return {
         "found":     True,
         "latitude":  row["latitude"],
@@ -947,6 +960,184 @@ async def get_node_last_gps(
     }
 
 #-----API ENDPOINTS END HERE----------------
+
+# ══════════════════════════════════════════════════════════════
+#  USER-NODE ENDPOINTS (new)
+# ══════════════════════════════════════════════════════════════
+
+@app.get("/me/nodes")
+async def get_my_nodes(current_user: dict = Depends(get_current_user)):
+    """Returns nodes assigned to the logged-in user (user role only)."""
+    conn = get_db_conn()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT un.node_id,
+               sr.temperature, sr.humidity, sr.flame, sr.smoke,
+               sr.ai_prediction, sr.confidence, sr.local_timestamp,
+               sr.latitude, sr.longitude, sr.rssi, sr.gateway_id,
+               n.location_name
+        FROM user_nodes un
+        LEFT JOIN sensor_readings sr ON sr.node_id = un.node_id
+          AND sr.id = (SELECT MAX(id) FROM sensor_readings WHERE node_id = un.node_id)
+        LEFT JOIN nodes n ON n.node_id = un.node_id
+        WHERE un.user_id = %s
+    """, (current_user["id"],))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+@app.get("/me/nodes/{node_id}/history")
+async def get_my_node_history(
+    node_id: str,
+    limit: int = 50,
+    current_user: dict = Depends(get_current_user)
+):
+    """Returns history for one of the user's assigned nodes."""
+    conn = get_db_conn()
+    cur = conn.cursor(dictionary=True)
+    # Verify this node is actually assigned to this user
+    cur.execute(
+        "SELECT 1 FROM user_nodes WHERE user_id = %s AND node_id = %s",
+        (current_user["id"], node_id)
+    )
+    if not cur.fetchone():
+        cur.close(); conn.close()
+        raise HTTPException(403, "Node not assigned to you")
+    cur.execute("""
+        SELECT temperature, humidity, flame, smoke,
+               ai_prediction, confidence, local_timestamp, rssi
+        FROM sensor_readings
+        WHERE node_id = %s
+        ORDER BY id DESC
+        LIMIT %s
+    """, (node_id, limit))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
+
+# ══════════════════════════════════════════════════════════════
+#  ADMIN USER-MANAGEMENT ENDPOINTS (new)
+# ══════════════════════════════════════════════════════════════
+
+@app.get("/admin/users")
+async def list_users(
+    search: str = "",
+    role: str = "",
+    page: int = 1,
+    limit: int = 20,
+    _admin = Depends(admin_required)
+):
+    """Paginated user list with search and role filter."""
+    conn = get_db_conn()
+    cur = conn.cursor(dictionary=True)
+    where, params = ["1=1"], []
+
+    if search:
+        where.append("(u.username LIKE %s OR u.email LIKE %s OR un.node_id LIKE %s)")
+        s = f"%{search}%"
+        params += [s, s, s]
+    if role == "user":
+        where.append("u.org_id IS NULL AND u.is_admin = 0")
+    elif role == "member":
+        where.append("u.org_id IS NOT NULL AND u.is_admin = 0")
+    elif role == "admin":
+        where.append("u.is_admin = 1")
+
+    sql = f"""
+        SELECT u.id, u.username, u.email, u.is_admin, u.org_id,
+               o.name AS org_name,
+               GROUP_CONCAT(DISTINCT un.node_id) AS assigned_nodes
+        FROM users u
+        LEFT JOIN organizations o ON o.id = u.org_id
+        LEFT JOIN user_nodes un ON un.user_id = u.id
+        WHERE {' AND '.join(where)}
+        GROUP BY u.id
+        ORDER BY u.username
+        LIMIT %s OFFSET %s
+    """
+    params += [limit, (page - 1) * limit]
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    for r in rows:
+        r["assigned_nodes"] = r["assigned_nodes"].split(",") if r["assigned_nodes"] else []
+    return rows
+
+
+@app.post("/admin/users/{user_id}/assign-node")
+async def assign_node_to_user(
+    user_id: int,
+    body: AssignNodeBody,
+    _admin = Depends(admin_required)
+):
+    """Assign a node to a user."""
+    conn = get_db_conn()
+    cur = conn.cursor(dictionary=True)
+
+    # Verify user exists
+    cur.execute("SELECT id, username FROM users WHERE id = %s", (user_id,))
+    user = cur.fetchone()
+    if not user:
+        cur.close(); conn.close()
+        raise HTTPException(404, "User not found")
+
+    cur.execute("""
+        INSERT IGNORE INTO user_nodes (user_id, node_id, assigned_by)
+        VALUES (%s, %s, %s)
+    """, (user_id, body.node_id, _admin["id"]))
+    conn.commit()
+    cur.close(); conn.close()
+    return {"message": f"Node '{body.node_id}' assigned to user '{user['username']}'"}
+
+
+@app.delete("/admin/users/{user_id}/nodes/{node_id}")
+async def remove_node_from_user(
+    user_id: int,
+    node_id: str,
+    _admin = Depends(admin_required)
+):
+    """Remove a node assignment from a user."""
+    conn = get_db_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM user_nodes WHERE user_id = %s AND node_id = %s",
+        (user_id, node_id)
+    )
+    if cur.rowcount == 0:
+        cur.close(); conn.close()
+        raise HTTPException(404, "Assignment not found")
+    conn.commit()
+    cur.close(); conn.close()
+    return {"message": f"Node '{node_id}' removed from user {user_id}"}
+
+
+@app.get("/admin/users/{user_id}/nodes")
+async def get_user_assigned_nodes(
+    user_id: int,
+    _admin = Depends(admin_required)
+):
+    """Get all nodes assigned to a specific user."""
+    conn = get_db_conn()
+    cur = conn.cursor(dictionary=True)
+    cur.execute("""
+        SELECT un.node_id, un.assigned_at,
+               a.username AS assigned_by_username,
+               sr.temperature, sr.humidity, sr.flame, sr.smoke,
+               sr.ai_prediction, sr.local_timestamp
+        FROM user_nodes un
+        LEFT JOIN users a ON a.id = un.assigned_by
+        LEFT JOIN sensor_readings sr ON sr.node_id = un.node_id
+          AND sr.id = (SELECT MAX(id) FROM sensor_readings WHERE node_id = un.node_id)
+        WHERE un.user_id = %s
+        ORDER BY un.assigned_at DESC
+    """, (user_id,))
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+    return rows
+
 
 #---DELETION----
 @app.delete("/users/{user_id}")
@@ -1007,27 +1198,22 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
 #  INCIDENTS
 # ══════════════════════════════════════════════════════════════
 
-# Traffic state endpoints
 @app.get("/traffic-state")
 async def get_traffic_state(current_user: dict = Depends(get_current_user)):
-    """Return the server-side shared traffic state so all clients/devices stay in sync."""
     return _shared_traffic
 
 @app.post("/traffic-state")
 async def save_traffic_state(payload: dict, current_user: dict = Depends(get_current_user)):
-    """Frontend posts latest TomTom traffic data here so all devices share same state."""
     import time
     for key, data in payload.items():
         if data and isinstance(data, dict):
-            data["fetchedAt"] = int(time.time() * 1000)  # server-authoritative timestamp ms
+            data["fetchedAt"] = int(time.time() * 1000)
             _set_traffic(key, data)
-    # Broadcast to all connected clients so they update immediately
     await manager.broadcast({"type": "traffic_update", "state": _shared_traffic})
     return {"ok": True}
 
 @app.post("/api/traffic-flow")
 async def proxy_traffic_flow(payload: dict, current_user: dict = Depends(get_current_user)):
-    """Proxy TomTom flow API — keeps API key hidden from browser source code."""
     coords = payload.get("coords", [])
     if not coords:
         return {"traffic": None}
@@ -1036,7 +1222,6 @@ async def proxy_traffic_flow(payload: dict, current_user: dict = Depends(get_cur
 
 @app.get("/api/tomtom-tile-key")
 async def get_tomtom_tile_key(current_user: dict = Depends(get_current_user)):
-    """Return TomTom tile key so frontend can build tile URL without hardcoding the key."""
     return {"key": TOMTOM_KEY}
 
 @app.get("/incidents/active")
@@ -1049,61 +1234,43 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
 
     if is_admin:
         cur.execute("""
-            SELECT
-                fi.id            AS incident_id,
-                fi.node_id,
-                fi.gateway_id,
-                fi.ai_prediction,
-                fi.confidence,
-                fi.temperature,
-                fi.humidity,
-                fi.flame,
-                fi.smoke,
-                fi.latitude,
-                fi.longitude,
-                fi.started_at,
-                fi.last_updated_at,
-                fi.assigned_team,
-                fi.dispatch_time,
-                fi.vehicle_type,
-                fi.trigger_source,
+            SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
+                fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity,
+                fi.flame, fi.smoke, fi.latitude, fi.longitude,
+                fi.started_at, fi.last_updated_at,
+                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             WHERE fi.status = 'active'
-            ORDER BY fi.last_updated_at DESC
-            LIMIT 50
+            ORDER BY fi.last_updated_at DESC LIMIT 50
         """)
-    else:
-        if not user_org:
-            cur.close(); conn.close()
-            return []
+    elif user_org:
         cur.execute("""
-            SELECT
-                fi.id            AS incident_id,
-                fi.node_id,
-                fi.gateway_id,
-                fi.ai_prediction,
-                fi.confidence,
-                fi.temperature,
-                fi.humidity,
-                fi.flame,
-                fi.smoke,
-                fi.latitude,
-                fi.longitude,
-                fi.started_at,
-                fi.last_updated_at,
-                fi.assigned_team,
-                fi.dispatch_time,
-                fi.vehicle_type,
-                fi.trigger_source,
+            SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
+                fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity,
+                fi.flame, fi.smoke, fi.latitude, fi.longitude,
+                fi.started_at, fi.last_updated_at,
+                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
-            WHERE fi.status = 'active'
-              AND g.org_id = %s
-            ORDER BY fi.last_updated_at DESC
-            LIMIT 50
+            WHERE fi.status = 'active' AND g.org_id = %s
+            ORDER BY fi.last_updated_at DESC LIMIT 50
         """, (user_org,))
+    else:
+        # User role: incidents on their assigned nodes only
+        cur.execute("""
+            SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
+                fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity,
+                fi.flame, fi.smoke, fi.latitude, fi.longitude,
+                fi.started_at, fi.last_updated_at,
+                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            INNER JOIN user_nodes un ON un.node_id = fi.node_id
+            WHERE fi.status = 'active' AND un.user_id = %s
+            ORDER BY fi.last_updated_at DESC LIMIT 50
+        """, (current_user["id"],))
 
     rows = cur.fetchall()
     cur.close()
@@ -1111,16 +1278,9 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
 
     incidents = []
     for row in rows:
-        pred          = (row["ai_prediction"] or "").lower()
+        pred = (row["ai_prediction"] or "").lower()
         confidence_val = float(row["confidence"]) if row["confidence"] is not None else 0.0
         confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
-
-        if pred == "fire":
-            inc_status   = "Active"
-            status_class = "txt-active"
-        else:
-            inc_status   = "Possible Fire"
-            status_class = "txt-contained"
 
         incidents.append({
             "incident_id":    row["incident_id"],
@@ -1131,8 +1291,8 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "ai_prediction":  row["ai_prediction"],
             "confidence":     confidence_pct,
             "confidence_pct": round(confidence_pct * 100, 1),
-            "status":         inc_status,
-            "status_class":   status_class,
+            "status":         "Active" if pred == "fire" else "Possible Fire",
+            "status_class":   "txt-active" if pred == "fire" else "txt-contained",
             "temperature":    row["temperature"],
             "humidity":       row["humidity"],
             "smoke":          row["smoke"],
@@ -1140,7 +1300,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "timestamp":      format_local_timestamp(row["last_updated_at"]),
             "started_at":     format_local_timestamp(row["started_at"]),
             "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
-            "resolved_at":    format_local_timestamp(row["resolved_at"]) if row.get("resolved_at") else None,
+            "resolved_at":    None,
             "assigned_team":  row["assigned_team"],
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
@@ -1154,7 +1314,6 @@ async def get_incident_history(
     limit: int = 100,
     current_user: dict = Depends(get_current_user)
 ):
-    """Returns both active and resolved incidents for history/audit."""
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
@@ -1163,25 +1322,26 @@ async def get_incident_history(
 
     if is_admin:
         cur.execute("""
-            SELECT fi.*,
-                   CONCAT('Node ', fi.node_id) AS location_name
+            SELECT fi.*, CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
-            ORDER BY fi.started_at DESC
-            LIMIT %s
+            ORDER BY fi.started_at DESC LIMIT %s
         """, (limit,))
-    else:
-        if not user_org:
-            cur.close(); conn.close()
-            return []
+    elif user_org:
         cur.execute("""
-            SELECT fi.*,
-                   CONCAT('Node ', fi.node_id) AS location_name
+            SELECT fi.*, CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
             WHERE g.org_id = %s
-            ORDER BY fi.started_at DESC
-            LIMIT %s
+            ORDER BY fi.started_at DESC LIMIT %s
         """, (user_org, limit))
+    else:
+        cur.execute("""
+            SELECT fi.*, CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            INNER JOIN user_nodes un ON un.node_id = fi.node_id
+            WHERE un.user_id = %s
+            ORDER BY fi.started_at DESC LIMIT %s
+        """, (current_user["id"], limit))
 
     rows = cur.fetchall()
     cur.close()
@@ -1199,7 +1359,6 @@ async def get_resolved_incidents(
     limit: int = 100,
     current_user: dict = Depends(get_current_user)
 ):
-    """Returns only resolved incidents, most recently resolved first."""
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
@@ -1208,27 +1367,27 @@ async def get_resolved_incidents(
 
     if is_admin:
         cur.execute("""
-            SELECT fi.*,
-                   CONCAT('Node ', fi.node_id) AS location_name
+            SELECT fi.*, CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             WHERE fi.status = 'resolved'
-            ORDER BY fi.resolved_at DESC
-            LIMIT %s
+            ORDER BY fi.resolved_at DESC LIMIT %s
         """, (limit,))
-    else:
-        if not user_org:
-            cur.close(); conn.close()
-            return []
+    elif user_org:
         cur.execute("""
-            SELECT fi.*,
-                   CONCAT('Node ', fi.node_id) AS location_name
+            SELECT fi.*, CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
-            WHERE fi.status = 'resolved'
-              AND g.org_id = %s
-            ORDER BY fi.resolved_at DESC
-            LIMIT %s
+            WHERE fi.status = 'resolved' AND g.org_id = %s
+            ORDER BY fi.resolved_at DESC LIMIT %s
         """, (user_org, limit))
+    else:
+        cur.execute("""
+            SELECT fi.*, CONCAT('Node ', fi.node_id) AS location_name
+            FROM fire_incidents fi
+            INNER JOIN user_nodes un ON un.node_id = fi.node_id
+            WHERE fi.status = 'resolved' AND un.user_id = %s
+            ORDER BY fi.resolved_at DESC LIMIT %s
+        """, (current_user["id"], limit))
 
     rows = cur.fetchall()
     cur.close()
@@ -1238,7 +1397,6 @@ async def get_resolved_incidents(
     for row in rows:
         confidence_val = float(row["confidence"]) if row.get("confidence") is not None else 0.0
         confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
-
         result.append({
             "incident_id":    row["id"],
             "node_id":        row["node_id"],
@@ -1268,7 +1426,6 @@ async def get_resolved_incidents(
     return result
 
 
-# ── GET single incident by ID ──────────────────────────────────
 @app.get("/incidents/{incident_id}")
 async def get_incident_by_id(
     incident_id: int,
@@ -1277,11 +1434,9 @@ async def get_incident_by_id(
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     cur.execute("""
-        SELECT fi.*,
-               CONCAT('Node ', fi.node_id) AS location_name
+        SELECT fi.*, CONCAT('Node ', fi.node_id) AS location_name
         FROM fire_incidents fi
-        WHERE fi.id = %s
-        LIMIT 1
+        WHERE fi.id = %s LIMIT 1
     """, (incident_id,))
     row = cur.fetchone()
     cur.close(); conn.close()
@@ -1291,7 +1446,6 @@ async def get_incident_by_id(
 
     confidence_val = float(row["confidence"]) if row.get("confidence") is not None else 0.0
     confidence_pct = confidence_val if confidence_val <= 1.0 else confidence_val / 100.0
-    pred = (row.get("ai_prediction") or "").lower()
 
     return {
         "incident_id":    row["id"],
@@ -1326,7 +1480,6 @@ async def respond_to_incident(
     body: RespondIncidentBody,
     current_user: dict = Depends(get_current_user)
 ):
-    """Mark an organization as responding to an incident."""
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
@@ -1339,12 +1492,10 @@ async def respond_to_incident(
     assigned_team = body.organization_name or str(body.organization_id) or "Unknown"
     vehicle_type  = body.vehicle_type or None
 
-    # Fetch existing dispatch info to detect edit vs fresh dispatch
     cur.execute("SELECT assigned_team, dispatch_time FROM fire_incidents WHERE id = %s", (incident_id,))
     existing_dispatch = cur.fetchone()
     is_edit = bool(existing_dispatch and existing_dispatch.get("assigned_team"))
 
-    # Preserve original dispatch_time on edits unless explicitly provided
     if is_edit and not body.dispatch_time:
         dispatch_time = format_local_timestamp(existing_dispatch.get("dispatch_time")) \
                         if existing_dispatch.get("dispatch_time") else \
@@ -1362,8 +1513,6 @@ async def respond_to_incident(
     node_id = inc["node_id"]
     cur.close(); conn.close()
 
-    # Broadcast full dispatch details so ALL clients (logged in or not) can update their
-    # rescue map — whether this is a fresh dispatch or an edit to an existing one.
     broadcast_action = "dispatch_updated" if is_edit else "responded"
     await manager.broadcast({
         "type":          "incident_update",
@@ -1374,10 +1523,7 @@ async def respond_to_incident(
         "dispatch_time": dispatch_time,
         "vehicle_type":  vehicle_type,
     })
-    await manager.broadcast({
-        "type":    "node_update",
-        "node_id": node_id,
-    })
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
 
     return {"message": f"Incident {incident_id} assigned to {assigned_team}"}
 
@@ -1388,7 +1534,6 @@ async def resolve_incident(
     body: ResolveIncidentBody,
     current_user: dict = Depends(get_current_user)
 ):
-    """Manually resolve an active fire incident."""
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
     now_str = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
@@ -1410,23 +1555,16 @@ async def resolve_incident(
         WHERE id = %s
     """, (now_str, body.notes, incident_id))
     conn.commit()
-    # Immediately clean up traffic state so resolved incident disappears from all devices
     _shared_traffic.pop(f'incident_{incident_id}', None)
     cur.close(); conn.close()
 
-    # Broadcast incident resolved — includes node_id and action so all clients
-    # can immediately remove the fire animation without waiting for the poll cycle
     await manager.broadcast({
         "type":        "incident_update",
         "incident_id": incident_id,
         "action":      "resolved",
         "node_id":     node_id,
     })
-    # Also broadcast a node_update so loadAndPlaceNodes() fires on all clients
-    await manager.broadcast({
-        "type":    "node_update",
-        "node_id": node_id,
-    })
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
 
     return {"message": f"Incident {incident_id} resolved", "resolved_at": now_str}
 
@@ -1474,12 +1612,14 @@ async def delete_pin(pin_id: int, current_user: dict = Depends(get_current_user)
     cur.close(); conn.close()
     return {"message": "Pin deleted"}
 
+
 # ── Login / Signup ────────────────────────────────────
 @app.post("/signup")
 async def signup(user: UserCreate):
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
 
+    # Check org permanent invite code first
     cur.execute("""
         SELECT id, name FROM organizations
         WHERE invite_code = %s
@@ -1491,6 +1631,7 @@ async def signup(user: UserCreate):
     if org:
         org_id = org['id']
     else:
+        # Check invite_codes table
         cur.execute("""
             SELECT org_id, code, expires_at, max_uses, uses
             FROM invite_codes
@@ -1506,11 +1647,13 @@ async def signup(user: UserCreate):
             cur.execute("UPDATE invite_codes SET uses = uses + 1 WHERE code = %s", (user.invite_code,))
             conn.commit()
         else:
-            cur.close(); conn.close()
-            raise HTTPException(status_code=400, detail="Invalid or expired invite code")
-
-    if not org_id:
-        raise HTTPException(status_code=400, detail="Invalid or expired invite code")
+            # ── NEW: allow signup with a special "USER" invite code that sets no org ──
+            # If invite_code is "USER-SIGNUP" (or whatever you configure), create a plain user
+            if user.invite_code.upper() == os.getenv("USER_SIGNUP_CODE", "USER-SIGNUP"):
+                org_id = None  # user role — no org
+            else:
+                cur.close(); conn.close()
+                raise HTTPException(status_code=400, detail="Invalid or expired invite code")
 
     cur.execute(
         "SELECT id FROM users WHERE username = %s OR (email = %s AND email IS NOT NULL)",
@@ -1529,6 +1672,7 @@ async def signup(user: UserCreate):
     cur.close(); conn.close()
     return {"message": "Account created", "organization_id": org_id}
 
+
 @app.post("/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     conn = get_db_conn()
@@ -1544,6 +1688,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         )
     access_token = create_access_token(data={"sub": user["username"]})
     return {"access_token": access_token, "token_type": "bearer"}
+
 
 @app.post("/gateways")
 async def register_gateway(
@@ -1569,6 +1714,7 @@ async def register_gateway(
         "gateway_id":      gateway.gateway_id,
         "organization_id": current_user['org_id'],
     }
+
 
 @app.post("/admin/invite-codes")
 async def admin_create_invite_code(
@@ -1600,6 +1746,7 @@ async def admin_create_invite_code(
         "max_uses":          invite.max_uses,
     }
 
+
 @app.post("/organizations/{org_id}/invite-codes")
 async def create_invite_code_for_org(
     org_id: int,
@@ -1629,9 +1776,10 @@ async def create_invite_code_for_org(
         "max_uses":        invite.max_uses,
     }
 
+
 @app.post("/notify-new-data")
 async def notify_new_data(data: dict):
-    # ── 1. Derive trigger_source ───────────────────────────────────────────────
+    # Normalise field aliases
     if "node_id" not in data and "node" in data:
         data["node_id"] = data["node"]
     if "latitude" not in data and "lat" in data:
@@ -1642,7 +1790,6 @@ async def notify_new_data(data: dict):
         data["temperature"] = data["temp"]
     if "humidity" not in data and "hum" in data:
         data["humidity"] = data["hum"]
-
     if "trigger_source" not in data:
         data["trigger_source"] = "manual" if data.get("manual_fire") else "ai"
 
@@ -1652,7 +1799,6 @@ async def notify_new_data(data: dict):
     is_fire    = pred in ("fire", "false")
     is_normal  = pred == "normal"
 
-    # ── 2. Normalise confidence ────────────────────────────────────────────────
     conf_raw = data.get("confidence", 0)
     try:
         conf_val = float(str(conf_raw).replace("%", ""))
@@ -1661,7 +1807,6 @@ async def notify_new_data(data: dict):
     except (ValueError, TypeError):
         conf_val = 0.0
 
-    # ── 3. DB work ─────────────────────────────────────────────────────────────
     resolved_incident_id = None
     new_or_updated_inc   = None
     try:
@@ -1715,10 +1860,8 @@ async def notify_new_data(data: dict):
     except Exception as e:
         print(f"[notify-new-data] DB error: {e}")
 
-    # ── 4. Broadcast raw sensor reading ────────────────────────────────────────
     await manager.broadcast(data)
 
-    # ── 5. Broadcast incident_update so dashboard refreshes incident list ──────
     if new_or_updated_inc:
         await manager.broadcast({
             "type":           "incident_update",
@@ -1761,10 +1904,8 @@ async def simulate_fire(
 ):
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
-
     is_admin = current_user.get('is_admin') == 1
     user_org = current_user.get('org_id')
-
     if not is_admin:
         cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
         gw = cur.fetchone()
@@ -1774,123 +1915,51 @@ async def simulate_fire(
         if gw['org_id'] != user_org:
             cur.close(); conn.close()
             raise HTTPException(403, "You can only simulate fire on your own organization's gateways")
-
     now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
-
     cur.execute("""
         INSERT INTO sensor_readings
         (gateway_id, node_id, timestamp, local_timestamp,
          temperature, humidity, flame, smoke,
          latitude, longitude, rssi, snr, ai_prediction, confidence)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (gateway_id, node_id, now, now,
-          52.3, 25, 1, 920,
-          16.0435, 120.3351,
-          -68, 7.2, 'fire', 0.95))
-
+    """, (gateway_id, node_id, now, now, 52.3, 25, 1, 920, 16.0435, 120.3351, -68, 7.2, 'fire', 0.95))
     upsert_fire_incident(cur, {
-        "node_id":        node_id,
-        "gateway_id":     gateway_id,
-        "ai_prediction":  "fire",
-        "confidence":     0.95,
-        "temperature":    52.3,
-        "humidity":       25,
-        "flame":          1,
-        "smoke":          920,
-        "latitude":       16.0435,
-        "longitude":      120.3351,
-        "local_timestamp": now,
+        "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "fire",
+        "confidence": 0.95, "temperature": 52.3, "humidity": 25, "flame": 1, "smoke": 920,
+        "latitude": 16.0435, "longitude": 120.3351, "local_timestamp": now,
     })
-
     conn.commit()
     cur.close(); conn.close()
-
-    # Broadcast both incident_update AND node_update so all clients react immediately
-    await manager.broadcast({
-        "type":          "incident_update",
-        "node_id":       node_id,
-        "gateway_id":    gateway_id,
-        "ai_prediction": "fire",
-        "confidence":    0.95,
-        "timestamp":     now,
-        "latitude":      16.0435,
-        "longitude":     120.3351,
-    })
-    await manager.broadcast({
-        "type":    "node_update",
-        "node_id": node_id,
-    })
-
+    await manager.broadcast({"type": "incident_update", "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "fire", "confidence": 0.95, "timestamp": now, "latitude": 16.0435, "longitude": 120.3351})
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
     return {"message": f"Fire simulated on {node_id} via {gateway_id}", "timestamp": now}
 
+
 @app.post("/dev/simulate-fire-2")
-async def simulate_fire(
+async def simulate_fire_2(
     node_id: str = "Node2",
     gateway_id: str = "GW1",
     current_user: dict = Depends(get_current_user)
 ):
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
-
-    is_admin = current_user.get('is_admin') == 1
-    user_org = current_user.get('org_id')
-
-    if not is_admin:
-        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
-        gw = cur.fetchone()
-        if not gw:
-            cur.close(); conn.close()
-            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
-        if gw['org_id'] != user_org:
-            cur.close(); conn.close()
-            raise HTTPException(403, "You can only simulate fire on your own organization's gateways")
-
     now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
-
     cur.execute("""
         INSERT INTO sensor_readings
         (gateway_id, node_id, timestamp, local_timestamp,
          temperature, humidity, flame, smoke,
          latitude, longitude, rssi, snr, ai_prediction, confidence)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (gateway_id, node_id, now, now,
-          52.3, 25, 1, 920,
-          16.0379, 120.3468,
-          -68, 7.2, 'fire', 0.95))
-
+    """, (gateway_id, node_id, now, now, 52.3, 25, 1, 920, 16.0379, 120.3468, -68, 7.2, 'fire', 0.95))
     upsert_fire_incident(cur, {
-        "node_id":        node_id,
-        "gateway_id":     gateway_id,
-        "ai_prediction":  "fire",
-        "confidence":     0.95,
-        "temperature":    52.3,
-        "humidity":       25,
-        "flame":          1,
-        "smoke":          920,
-        "latitude":       16.0379,
-        "longitude":      120.3468,
-        "local_timestamp": now,
+        "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "fire",
+        "confidence": 0.95, "temperature": 52.3, "humidity": 25, "flame": 1, "smoke": 920,
+        "latitude": 16.0379, "longitude": 120.3468, "local_timestamp": now,
     })
-
     conn.commit()
     cur.close(); conn.close()
-
-    # Broadcast both incident_update AND node_update so all clients react immediately
-    await manager.broadcast({
-        "type":          "incident_update",
-        "node_id":       node_id,
-        "gateway_id":    gateway_id,
-        "ai_prediction": "fire",
-        "confidence":    0.95,
-        "timestamp":     now,
-        "latitude":      16.0379,
-        "longitude":     120.3468,
-    })
-    await manager.broadcast({
-        "type":    "node_update",
-        "node_id": node_id,
-    })
-
+    await manager.broadcast({"type": "incident_update", "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "fire", "confidence": 0.95, "timestamp": now, "latitude": 16.0379, "longitude": 120.3468})
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
     return {"message": f"Fire simulated on {node_id} via {gateway_id}", "timestamp": now}
 
 
@@ -1902,66 +1971,23 @@ async def simulate_false(
 ):
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
-
-    is_admin = current_user.get('is_admin') == 1
-    user_org = current_user.get('org_id')
-
-    if not is_admin:
-        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
-        gw = cur.fetchone()
-        if not gw:
-            cur.close(); conn.close()
-            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
-        if gw['org_id'] != user_org:
-            cur.close(); conn.close()
-            raise HTTPException(403, "You can only simulate on your own organization's gateways")
-
     now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
-
     cur.execute("""
         INSERT INTO sensor_readings
         (gateway_id, node_id, timestamp, local_timestamp,
          temperature, humidity, flame, smoke,
          latitude, longitude, rssi, snr, ai_prediction, confidence)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (gateway_id, node_id, now, now,
-          38.5, 40, 1, 450,
-          16.0435, 120.3351,
-          -68, 7.2, 'false', 0.55))
-
+    """, (gateway_id, node_id, now, now, 38.5, 40, 1, 450, 16.0435, 120.3351, -68, 7.2, 'false', 0.55))
     upsert_fire_incident(cur, {
-        "node_id":        node_id,
-        "gateway_id":     gateway_id,
-        "ai_prediction":  "false",
-        "confidence":     0.55,
-        "temperature":    38.5,
-        "humidity":       40,
-        "flame":          1,
-        "smoke":          450,
-        "latitude":       16.0435,
-        "longitude":      120.3351,
-        "local_timestamp": now,
+        "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "false",
+        "confidence": 0.55, "temperature": 38.5, "humidity": 40, "flame": 1, "smoke": 450,
+        "latitude": 16.0435, "longitude": 120.3351, "local_timestamp": now,
     })
-
     conn.commit()
     cur.close(); conn.close()
-
-    # Broadcast both incident_update AND node_update so all clients react immediately
-    await manager.broadcast({
-        "type":          "incident_update",
-        "node_id":       node_id,
-        "gateway_id":    gateway_id,
-        "ai_prediction": "false",
-        "confidence":    0.55,
-        "timestamp":     now,
-        "latitude":      16.0435,
-        "longitude":     120.3351,
-    })
-    await manager.broadcast({
-        "type":    "node_update",
-        "node_id": node_id,
-    })
-
+    await manager.broadcast({"type": "incident_update", "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "false", "confidence": 0.55, "timestamp": now, "latitude": 16.0435, "longitude": 120.3351})
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
     return {"message": f"'False' prediction simulated on {node_id} via {gateway_id}", "timestamp": now}
 
 
@@ -1973,129 +1999,45 @@ async def simulate_normal(
 ):
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
-
-    is_admin = current_user.get('is_admin') == 1
-    user_org = current_user.get('org_id')
-
-    if not is_admin:
-        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
-        gw = cur.fetchone()
-        if not gw:
-            cur.close(); conn.close()
-            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
-        if gw['org_id'] != user_org:
-            cur.close(); conn.close()
-            raise HTTPException(403, "You can only simulate on your own organization's gateways")
-
     now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
-
     cur.execute("""
         INSERT INTO sensor_readings
         (gateway_id, node_id, timestamp, local_timestamp,
          temperature, humidity, flame, smoke,
          latitude, longitude, rssi, snr, ai_prediction, confidence)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (gateway_id, node_id, now, now,
-          24.5, 61, 0, 0,
-          16.0435, 120.3351,
-          -68, 7.2, 'normal', 0.99))
-
-    upsert_fire_incident(cur, {
-        "node_id":        node_id,
-        "gateway_id":     gateway_id,
-        "ai_prediction":  "normal",
-        "local_timestamp": now,
-    })
-
+    """, (gateway_id, node_id, now, now, 24.5, 61, 0, 0, 16.0435, 120.3351, -68, 7.2, 'normal', 0.99))
+    upsert_fire_incident(cur, {"node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "normal", "local_timestamp": now})
     conn.commit()
     cur.close(); conn.close()
-
-    # Broadcast both incident_update AND node_update so all clients react immediately
-    await manager.broadcast({
-        "type":          "incident_update",
-        "node_id":       node_id,
-        "gateway_id":    gateway_id,
-        "ai_prediction": "normal",
-        "confidence":    0.99,
-        "timestamp":     now,
-        "latitude":      16.0435,
-        "longitude":     120.3351,
-    })
-    await manager.broadcast({
-        "type":    "node_update",
-        "node_id": node_id,
-    })
-
+    await manager.broadcast({"type": "incident_update", "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "normal", "confidence": 0.99, "timestamp": now, "latitude": 16.0435, "longitude": 120.3351})
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
     return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
 
 
 @app.post("/dev/simulate-normal-2")
-async def simulate_normal(
+async def simulate_normal_2(
     node_id: str = "Node2",
     gateway_id: str = "GW1",
     current_user: dict = Depends(get_current_user)
 ):
     conn = get_db_conn()
     cur = conn.cursor(dictionary=True)
-
-    is_admin = current_user.get('is_admin') == 1
-    user_org = current_user.get('org_id')
-
-    if not is_admin:
-        cur.execute("SELECT org_id FROM gateways WHERE gateway_id = %s", (gateway_id,))
-        gw = cur.fetchone()
-        if not gw:
-            cur.close(); conn.close()
-            raise HTTPException(404, f"Gateway '{gateway_id}' not found")
-        if gw['org_id'] != user_org:
-            cur.close(); conn.close()
-            raise HTTPException(403, "You can only simulate on your own organization's gateways")
-
     now = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
-
     cur.execute("""
         INSERT INTO sensor_readings
         (gateway_id, node_id, timestamp, local_timestamp,
          temperature, humidity, flame, smoke,
          latitude, longitude, rssi, snr, ai_prediction, confidence)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (gateway_id, node_id, now, now,
-          24.5, 61, 0, 0,
-          16.0379, 120.3468,
-          -68, 7.2, 'normal', 0.99))
-
-    upsert_fire_incident(cur, {
-        "node_id":        node_id,
-        "gateway_id":     gateway_id,
-        "ai_prediction":  "normal",
-        "local_timestamp": now,
-    })
-
+    """, (gateway_id, node_id, now, now, 24.5, 61, 0, 0, 16.0379, 120.3468, -68, 7.2, 'normal', 0.99))
+    upsert_fire_incident(cur, {"node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "normal", "local_timestamp": now})
     conn.commit()
     cur.close(); conn.close()
-
-    # Broadcast both incident_update AND node_update so all clients react immediately
-    await manager.broadcast({
-        "type":          "incident_update",
-        "node_id":       node_id,
-        "gateway_id":    gateway_id,
-        "ai_prediction": "normal",
-        "confidence":    0.99,
-        "timestamp":     now,
-        "latitude":      16.0379,
-        "longitude":     120.3468,
-    })
-    await manager.broadcast({
-        "type":    "node_update",
-        "node_id": node_id,
-    })
-
+    await manager.broadcast({"type": "incident_update", "node_id": node_id, "gateway_id": gateway_id, "ai_prediction": "normal", "confidence": 0.99, "timestamp": now, "latitude": 16.0379, "longitude": 120.3468})
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
     return {"message": f"Normal reading simulated on {node_id} via {gateway_id}", "timestamp": now}
 
-
-# ══════════════════════════════════════════════════════════════
-#  ORG DROPDOWN
-# ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
