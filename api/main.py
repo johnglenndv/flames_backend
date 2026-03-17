@@ -1647,13 +1647,8 @@ async def signup(user: UserCreate):
             cur.execute("UPDATE invite_codes SET uses = uses + 1 WHERE code = %s", (user.invite_code,))
             conn.commit()
         else:
-            # ── NEW: allow signup with a special "USER" invite code that sets no org ──
-            # If invite_code is "USER-SIGNUP" (or whatever you configure), create a plain user
-            if user.invite_code.upper() == os.getenv("USER_SIGNUP_CODE", "USER-SIGNUP"):
-                org_id = None  # user role — no org
-            else:
-                cur.close(); conn.close()
-                raise HTTPException(status_code=400, detail="Invalid or expired invite code")
+            # No valid org code — create as plain user with no org (user role)
+            org_id = None
 
     cur.execute(
         "SELECT id FROM users WHERE username = %s OR (email = %s AND email IS NOT NULL)",
