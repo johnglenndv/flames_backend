@@ -230,6 +230,9 @@ class RespondIncidentBody(BaseModel):
     dispatch_time: str | None = None
     vehicle_type: str | None = None
 
+class NotifyIncidentBody(BaseModel):
+    message: str | None = None
+
 # ── NEW: for assigning nodes to users ──
 class AssignNodeBody(BaseModel):
     node_id: str
@@ -846,7 +849,7 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
                    fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
                    fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
-                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source, fi.notified_at, fi.notified_by,
                    CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             WHERE fi.status = 'active'
@@ -857,7 +860,7 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
                    fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
                    fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
-                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source, fi.notified_at, fi.notified_by,
                    CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
@@ -870,7 +873,7 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             SELECT fi.id AS incident_id, fi.node_id, fi.gateway_id,
                    fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity, fi.flame, fi.smoke,
                    fi.latitude, fi.longitude, fi.started_at, fi.last_updated_at,
-                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                   fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source, fi.notified_at, fi.notified_by,
                    CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN user_nodes un ON un.node_id = fi.node_id
@@ -917,6 +920,8 @@ async def dashboard_init(current_user: dict = Depends(get_current_user)):
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
             "trigger_source": row.get("trigger_source", "ai"),
+            "notified_at":    format_local_timestamp(row.get("notified_at")) if row.get("notified_at") else None,
+            "notified_by":    row.get("notified_by"),
         })
 
     # Format user
@@ -1265,7 +1270,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity,
                 fi.flame, fi.smoke, fi.latitude, fi.longitude,
                 fi.started_at, fi.last_updated_at,
-                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source, fi.notified_at, fi.notified_by,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             WHERE fi.status = 'active'
@@ -1277,7 +1282,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity,
                 fi.flame, fi.smoke, fi.latitude, fi.longitude,
                 fi.started_at, fi.last_updated_at,
-                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source, fi.notified_at, fi.notified_by,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN gateways g ON g.gateway_id = fi.gateway_id
@@ -1291,7 +1296,7 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
                 fi.ai_prediction, fi.confidence, fi.temperature, fi.humidity,
                 fi.flame, fi.smoke, fi.latitude, fi.longitude,
                 fi.started_at, fi.last_updated_at,
-                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source,
+                fi.assigned_team, fi.dispatch_time, fi.vehicle_type, fi.trigger_source, fi.notified_at, fi.notified_by,
                 CONCAT('Node ', fi.node_id) AS location_name
             FROM fire_incidents fi
             INNER JOIN user_nodes un ON un.node_id = fi.node_id
@@ -1332,6 +1337,8 @@ async def get_active_incidents(current_user: dict = Depends(get_current_user)):
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
             "trigger_source": row.get("trigger_source", "ai"),
+            "notified_at":    format_local_timestamp(row.get("notified_at")) if row.get("notified_at") else None,
+            "notified_by":    row.get("notified_by"),
         })
     return incidents
 
@@ -1449,6 +1456,8 @@ async def get_resolved_incidents(
             "dispatch_time":  format_local_timestamp(row.get("dispatch_time")) if row.get("dispatch_time") else None,
             "vehicle_type":   row.get("vehicle_type"),
             "trigger_source": row.get("trigger_source", "ai"),
+            "notified_at":    format_local_timestamp(row.get("notified_at")) if row.get("notified_at") else None,
+            "notified_by":    row.get("notified_by"),
         })
     return result
 
@@ -1498,7 +1507,52 @@ async def get_incident_by_id(
         "started_at_utc": ph_local_to_utc_iso(row.get("started_at")),
         "resolved_at":    format_local_timestamp(row.get("resolved_at")) if row.get("resolved_at") else None,
         "trigger_source": row.get("trigger_source", "ai"),
+        "notified_at":    format_local_timestamp(row.get("notified_at")) if row.get("notified_at") else None,
+        "notified_by":    row.get("notified_by"),
     }
+
+
+@app.patch("/incidents/{incident_id}/notify")
+async def notify_incident(
+    incident_id: int,
+    body: NotifyIncidentBody,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = get_db_conn()
+    cur = conn.cursor(dictionary=True)
+
+    cur.execute("SELECT id, node_id, status, notified_at FROM fire_incidents WHERE id = %s", (incident_id,))
+    inc = cur.fetchone()
+    if not inc:
+        cur.close(); conn.close()
+        raise HTTPException(404, "Incident not found")
+    if inc["status"] == "resolved":
+        cur.close(); conn.close()
+        raise HTTPException(400, "Incident is already resolved")
+
+    now_str = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
+    notifier_name = current_user.get("username", "Unknown")
+    node_id = inc["node_id"]
+
+    cur.execute("""
+        UPDATE fire_incidents
+        SET notified_at = %s, notified_by = %s
+        WHERE id = %s
+    """, (now_str, notifier_name, incident_id))
+    conn.commit()
+    cur.close(); conn.close()
+
+    await manager.broadcast({
+        "type":          "incident_update",
+        "incident_id":   incident_id,
+        "action":        "notified",
+        "node_id":       node_id,
+        "notified_at":   now_str,
+        "notified_by":   notifier_name,
+    })
+    await manager.broadcast({"type": "node_update", "node_id": node_id})
+
+    return {"message": f"Incident {incident_id} marked as notified by {notifier_name}", "notified_at": now_str}
 
 
 @app.patch("/incidents/{incident_id}/respond")
@@ -1854,7 +1908,7 @@ async def notify_new_data(data: dict):
             })
             conn.commit()
             cur.execute("""
-                SELECT id, trigger_source, latitude, longitude
+                SELECT id, trigger_source, latitude, longitude, notified_at, notified_by
                 FROM fire_incidents
                 WHERE node_id = %s AND status = 'active'
                 LIMIT 1
@@ -1901,6 +1955,8 @@ async def notify_new_data(data: dict):
             "humidity":       data.get("humidity"),
             "flame":          data.get("flame"),
             "smoke":          data.get("smoke"),
+            "notified_at":    format_local_timestamp(new_or_updated_inc.get("notified_at")) if new_or_updated_inc.get("notified_at") else None,
+            "notified_by":    new_or_updated_inc.get("notified_by"),
         })
     elif resolved_incident_id:
         await manager.broadcast({
