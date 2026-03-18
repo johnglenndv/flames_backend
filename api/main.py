@@ -1200,6 +1200,10 @@ async def delete_organization(org_id: int, current_user: dict = Depends(admin_re
     if cur.fetchone()[0] > 0:
         cur.close(); conn.close()
         raise HTTPException(status_code=400, detail="Cannot delete organization with active users")
+    # Disassociate any gateways linked to this org before deleting
+    cur.execute("UPDATE gateways SET org_id = NULL WHERE org_id = %s", (org_id,))
+    # Nullify any invite codes pointing to this org
+    cur.execute("UPDATE invite_codes SET org_id = NULL WHERE org_id = %s", (org_id,))
     cur.execute("DELETE FROM organizations WHERE id = %s", (org_id,))
     if cur.rowcount == 0:
         cur.close(); conn.close()
