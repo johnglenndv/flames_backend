@@ -73,8 +73,7 @@ def on_message(client, userdata, msg):
         # Temporal feature engineering
         prev = node_history.get(node, {
             't': t, 's': s, 'f': f, 'h': h,
-            'manual_fire_active': False,
-            'dashboard_blocked': False,
+            'manual_fire_active': False
         })
 
         t_delta = t - prev['t']
@@ -102,78 +101,63 @@ def on_message(client, userdata, msg):
         trigger_source = "ai"
 
         if manual_fire:
-            # Kung ang previous na state ay hindi active (button was off before this press),
-            # ito ay isang BAGONG press — valid agad, kahit may dashboard_resolved pa sa DB.
-            was_previously_active = prev.get('manual_fire_active', False)
-            was_blocked           = prev.get('dashboard_blocked', False)
+            # Check kung may recently dashboard-resolved incident para sa node na ito.
+            # Kahit hawak pa ang button, kung niresolve na sa dashboard = i-block ang signal.
+            _conn_chk = mysql.connector.connect(**DB_CONFIG)
+            _cur_chk  = _conn_chk.cursor()
+            _cur_chk.execute("""
+                SELECT COUNT(*) FROM fire_incidents
+                WHERE node_id = %s
+                  AND status = 'resolved'
+                  AND dashboard_resolved = 1
+                  AND resolved_at >= DATE_SUB(NOW(), INTERVAL 10 MINUTE)
+            """, (node,))
+            _dashboard_resolved = _cur_chk.fetchone()[0] > 0
+            _cur_chk.close()
+            _conn_chk.close()
 
-            if not was_previously_active:
-                # FRESH press — bagong emergency, i-clear ang dashboard_resolved at mag-fire agad
-                _conn_clr = mysql.connector.connect(**DB_CONFIG)
-                _cur_clr  = _conn_clr.cursor()
-                _cur_clr.execute("""
-                    UPDATE fire_incidents
-                    SET dashboard_resolved = 0
-                    WHERE node_id = %s AND status = 'resolved' AND dashboard_resolved = 1
-                """, (node,))
-                _conn_clr.commit()
-                _cur_clr.close()
-                _conn_clr.close()
-
-                final_label    = "fire"
-                confidence     = 1.0
-                trigger_source = "manual"
-                node_history[node] = {
-                    't': t, 's': s, 'f': f, 'h': h,
-                    'manual_fire_active': True,
-                    'dashboard_blocked': False,
-                }
-                print(f"  [{node}] FRESH MANUAL FIRE PRESS — new incident")
-
-            elif was_blocked:
-                # Button hawak pa pero naka-block pa rin (dashboard resolved, hindi pa nire-release)
+            if _dashboard_resolved:
+                # Dashboard niresolve na — i-block ang manual_fire signal
                 trigger_source = "ai"
                 node_history[node] = {
                     't': t, 's': s, 'f': f, 'h': h,
                     'manual_fire_active': False,
-                    'dashboard_blocked': True,
                 }
                 print(f"  [{node}] manual_fire BLOCKED — dashboard already resolved this incident")
-
             else:
-                # Button hawak pa, active pa, walang block — normal continuation
+                # Walang dashboard resolve — normal na manual fire
                 final_label    = "fire"
                 confidence     = 1.0
                 trigger_source = "manual"
                 node_history[node] = {
                     't': t, 's': s, 'f': f, 'h': h,
                     'manual_fire_active': True,
-                    'dashboard_blocked': False,
                 }
-                print(f"  [{node}] MANUAL FIRE BUTTON ACTIVE (continuing)")
+                print(f"  [{node}] MANUAL FIRE BUTTON ACTIVE")
 
         else:
-            # manual_fire = False — button cancelled or not pressed
-            # Clear dashboard_resolved in DB para re-armed na
+            # manual_fire = False (button cancelled or not pressed)
+            # ALWAYS clear dashboard_resolved so the next press creates a new incident.
             _conn_clr = mysql.connector.connect(**DB_CONFIG)
             _cur_clr  = _conn_clr.cursor()
             _cur_clr.execute("""
                 UPDATE fire_incidents
                 SET dashboard_resolved = 0
-                WHERE node_id = %s AND status = 'resolved' AND dashboard_resolved = 1
+                WHERE node_id = %s
+                  AND status = 'resolved'
+                  AND dashboard_resolved = 1
             """, (node,))
             _conn_clr.commit()
             _cur_clr.close()
             _conn_clr.close()
 
             if prev.get('manual_fire_active', False):
-                # Coming from active manual fire
+                # Coming from active manual fire — check sensors before clearing
                 sensors_all_clear = (ai_label.lower() == "normal" and s < 20 and t < 40)
                 if sensors_all_clear:
                     node_history[node] = {
                         't': t, 's': s, 'f': f, 'h': h,
                         'manual_fire_active': False,
-                        'dashboard_blocked': False,
                     }
                     trigger_source = "ai"
                     print(f"  [{node}] Manual fire cancelled — button re-armed")
@@ -181,17 +165,13 @@ def on_message(client, userdata, msg):
                     final_label    = "fire"
                     confidence     = 1.0
                     trigger_source = "manual_lock"
-                    node_history[node].update({
-                        't': t, 's': s, 'f': f, 'h': h,
-                        'dashboard_blocked': False,
-                    })
+                    node_history[node].update({'t': t, 's': s, 'f': f, 'h': h})
                     print(f"  [{node}] Manual lock still active (sensors not clear)")
             else:
-                # Normal AI path
+                # Normal AI path — no manual fire involvement
                 node_history[node] = {
                     't': t, 's': s, 'f': f, 'h': h,
                     'manual_fire_active': False,
-                    'dashboard_blocked': False,
                 }
                 if final_label.lower() in ["fire", "false"]:
                     if (f > 0 and s < 50 and t < 40 and abs(t_delta) < 1.0) or (abs(t_delta) < 0.2 and s < 30):
