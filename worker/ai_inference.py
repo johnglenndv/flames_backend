@@ -60,7 +60,7 @@ def on_message(client, userdata, msg):
         rssi        = data.get("rssi")
         snr         = data.get("snr")
         manual_fire = payload.get("manual_fire", False)
-        
+
         ts_final = data.get("received_at", datetime.utcnow().isoformat())
 
         try:
@@ -70,7 +70,7 @@ def on_message(client, userdata, msg):
         except Exception:
             ts_early = datetime.now(PH_ZONE).strftime("%Y-%m-%d %H:%M:%S")
 
-        # ── Temporal feature engineering ──
+        # Temporal feature engineering
         prev = node_history.get(node, {
             't': t, 's': s, 'f': f, 'h': h,
             'manual_fire_active': False
@@ -83,19 +83,19 @@ def on_message(client, userdata, msg):
         t_roll  = (t + prev['t']) / 2
         s_roll  = (s + prev['s']) / 2
 
-        # ── AI inference ──
+        # AI inference
         features = [s, t, f, h, t_delta, s_delta, f_delta, h_delta, t_roll, s_roll]
         input_df = pd.DataFrame([features], columns=[
             'smoke', 'temperature', 'flame', 'humidity',
             'temp_delta', 'smoke_delta', 'flame_delta', 'hum_delta',
             'temp_roll_avg', 'smoke_roll_avg'
         ])
-        scaled_input = scaler.transform(input_df)
-        probs        = model.predict_proba(scaled_input)[0]
-        ai_label     = class_names[np.argmax(probs)]
+        scaled_input  = scaler.transform(input_df)
+        probs         = model.predict_proba(scaled_input)[0]
+        ai_label      = class_names[np.argmax(probs)]
         ai_confidence = float(np.max(probs))
 
-        # ── DECISION LOGIC & SOURCE TRACKING ──
+        # DECISION LOGIC & SOURCE TRACKING
         final_label    = ai_label
         confidence     = ai_confidence
         trigger_source = "ai"
@@ -123,7 +123,7 @@ def on_message(client, userdata, msg):
                     't': t, 's': s, 'f': f, 'h': h,
                     'manual_fire_active': False,
                 }
-                print(f"  🛑 [{node}] manual_fire BLOCKED — dashboard already resolved this incident")
+                print(f"  [{node}] manual_fire BLOCKED — dashboard already resolved this incident")
             else:
                 # Walang dashboard resolve — normal na manual fire
                 final_label    = "fire"
@@ -133,11 +133,11 @@ def on_message(client, userdata, msg):
                     't': t, 's': s, 'f': f, 'h': h,
                     'manual_fire_active': True,
                 }
-                print(f"  🚨 [{node}] MANUAL FIRE BUTTON ACTIVE")
+                print(f"  [{node}] MANUAL FIRE BUTTON ACTIVE")
 
-        elif not manual_fire and prev.get('manual_fire_active', False):
-            # Button cancelled (2nd press/toggle) — i-clear ang dashboard_resolved flag
-            # sa fire_incidents para maging valid ulit ang susunod na emergency press.
+        else:
+            # manual_fire = False (button cancelled or not pressed)
+            # ALWAYS clear dashboard_resolved so the next press creates a new incident.
             _conn_clr = mysql.connector.connect(**DB_CONFIG)
             _cur_clr  = _conn_clr.cursor()
             _cur_clr.execute("""
@@ -151,37 +151,38 @@ def on_message(client, userdata, msg):
             _cur_clr.close()
             _conn_clr.close()
 
-            sensors_all_clear = (ai_label.lower() == "normal" and s < 20 and t < 40)
-            if sensors_all_clear:
+            if prev.get('manual_fire_active', False):
+                # Coming from active manual fire — check sensors before clearing
+                sensors_all_clear = (ai_label.lower() == "normal" and s < 20 and t < 40)
+                if sensors_all_clear:
+                    node_history[node] = {
+                        't': t, 's': s, 'f': f, 'h': h,
+                        'manual_fire_active': False,
+                    }
+                    trigger_source = "ai"
+                    print(f"  [{node}] Manual fire cancelled — button re-armed")
+                else:
+                    final_label    = "fire"
+                    confidence     = 1.0
+                    trigger_source = "manual_lock"
+                    node_history[node].update({'t': t, 's': s, 'f': f, 'h': h})
+                    print(f"  [{node}] Manual lock still active (sensors not clear)")
+            else:
+                # Normal AI path — no manual fire involvement
                 node_history[node] = {
                     't': t, 's': s, 'f': f, 'h': h,
                     'manual_fire_active': False,
                 }
-                trigger_source = "ai"
-                print(f"  ✅ [{node}] Manual fire cancelled — button re-armed")
-            else:
-                final_label    = "fire"
-                confidence     = 1.0
-                trigger_source = "manual_lock"
-                node_history[node].update({'t': t, 's': s, 'f': f, 'h': h})
-                print(f"  🔒 [{node}] Manual lock still active (sensors not clear)")
+                if final_label.lower() in ["fire", "false"]:
+                    if (f > 0 and s < 50 and t < 40 and abs(t_delta) < 1.0) or (abs(t_delta) < 0.2 and s < 30):
+                        final_label = "Normal"
+                        confidence  = 0.98
 
-        else:
-            # Normal AI path — no manual fire involvement
-            node_history[node] = {
-                't': t, 's': s, 'f': f, 'h': h,
-                'manual_fire_active': False,
-            }
-            if final_label.lower() in ["fire", "false"]:
-                if (f > 0 and s < 50 and t < 40 and abs(t_delta) < 1.0) or (abs(t_delta) < 0.2 and s < 30):
-                    final_label = "Normal"
-                    confidence  = 0.98
-
-        # ── Database insert ──
+        # Database insert
         conn = mysql.connector.connect(**DB_CONFIG)
         ensure_gateway_exists(conn, gateway_id)
         cur = conn.cursor()
-        
+
         sql = """
             INSERT INTO sensor_readings
             (gateway_id, node_id, timestamp, local_timestamp,
@@ -204,24 +205,24 @@ def on_message(client, userdata, msg):
         cur.close()
         conn.close()
 
-        # ── Dashboard notify ──
+        # Dashboard notify
         requests.post(
             "https://flamesapp.up.railway.app/notify-new-data",
             json={
-                "type":          "new_reading",
-                "node_id":       node,
-                "ai_prediction": final_label,
-                "confidence":    f"{confidence*100:.2f}%",
+                "type":           "new_reading",
+                "node_id":        node,
+                "ai_prediction":  final_label,
+                "confidence":     f"{confidence*100:.2f}%",
                 "trigger_source": trigger_source,
-                "temperature":   t,
-                "humidity":      h,
-                "smoke":         s,
-                "flame":         f,
-                "latitude":      lat,
-                "longitude":     lon,
-                "rssi":          rssi,
-                "temp_delta":    round(t_delta, 2),
-                "manual_fire":   manual_fire,
+                "temperature":    t,
+                "humidity":       h,
+                "smoke":          s,
+                "flame":          f,
+                "latitude":       lat,
+                "longitude":      lon,
+                "rssi":           rssi,
+                "temp_delta":     round(t_delta, 2),
+                "manual_fire":    manual_fire,
             },
             timeout=2
         )
