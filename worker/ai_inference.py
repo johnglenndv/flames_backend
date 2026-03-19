@@ -96,76 +96,40 @@ def on_message(client, userdata, msg):
         ai_confidence = float(np.max(probs))
 
         # ── DECISION LOGIC & SOURCE TRACKING ──
-        final_label    = ai_label
-        confidence     = ai_confidence
-        trigger_source = "ai"
+        final_label = ai_label
+        confidence  = ai_confidence
+        trigger_source = "ai" # Default source
 
         if manual_fire:
-            # Check kung niresolve na ng dashboard ang incident para sa node na ito.
-            # Kahit hawak pa ng user ang button, kung niresolve na sa dashboard = i-block ang signal.
-            _conn_chk = mysql.connector.connect(**DB_CONFIG)
-            _cur_chk  = _conn_chk.cursor()
-            _cur_chk.execute(
-                "SELECT dashboard_resolved FROM nodes WHERE node_id = %s",
-                (node,)
-            )
-            _row = _cur_chk.fetchone()
-            _dashboard_resolved = bool(_row and _row[0])
-            _cur_chk.close()
-            _conn_chk.close()
+            final_label = "fire"
+            confidence  = 1.0
+            trigger_source = "manual"
+            node_history[node] = {
+                't': t, 's': s, 'f': f, 'h': h,
+                'manual_fire_active': True
+            }
+            print(f"  🚨 [{node}] MANUAL FIRE BUTTON ACTIVE")
 
-            if _dashboard_resolved:
-                # Dashboard niresolve na — i-block ang manual_fire signal
-                trigger_source = "ai"
-                node_history[node] = {
-                    't': t, 's': s, 'f': f, 'h': h,
-                    'manual_fire_active': False,
-                }
-                print(f"  🛑 [{node}] manual_fire BLOCKED — dashboard already resolved this incident")
-            else:
-                # Walang dashboard resolve — normal na manual fire
-                final_label    = "fire"
-                confidence     = 1.0
-                trigger_source = "manual"
-                node_history[node] = {
-                    't': t, 's': s, 'f': f, 'h': h,
-                    'manual_fire_active': True,
-                }
-                print(f"  🚨 [{node}] MANUAL FIRE BUTTON ACTIVE")
-
-        elif not manual_fire and prev.get('manual_fire_active', False):
-            # Button cancelled (2nd press/toggle) — i-clear ang dashboard_resolved flag.
-            # Re-armed na ang button para sa susunod na emergency.
-            _conn_clr = mysql.connector.connect(**DB_CONFIG)
-            _cur_clr  = _conn_clr.cursor()
-            _cur_clr.execute(
-                "UPDATE nodes SET dashboard_resolved = 0 WHERE node_id = %s",
-                (node,)
-            )
-            _conn_clr.commit()
-            _cur_clr.close()
-            _conn_clr.close()
-
+        elif prev.get('manual_fire_active', False):
             sensors_all_clear = (ai_label.lower() == "normal" and s < 20 and t < 40)
             if sensors_all_clear:
                 node_history[node] = {
                     't': t, 's': s, 'f': f, 'h': h,
-                    'manual_fire_active': False,
+                    'manual_fire_active': False
                 }
                 trigger_source = "ai"
-                print(f"  ✅ [{node}] Manual fire cancelled — button re-armed")
+                print(f"  ✅ [{node}] Manual fire lock released")
             else:
-                final_label    = "fire"
-                confidence     = 1.0
+                final_label = "fire"
+                confidence  = 1.0
                 trigger_source = "manual_lock"
                 node_history[node].update({'t': t, 's': s, 'f': f, 'h': h})
-                print(f"  🔒 [{node}] Manual lock still active (sensors not clear)")
-
+                print(f"  🔒 [{node}] Manual lock active (keeping fire label)")
         else:
-            # Normal AI path — no manual fire involvement
+            # Safety filter logic
             node_history[node] = {
                 't': t, 's': s, 'f': f, 'h': h,
-                'manual_fire_active': False,
+                'manual_fire_active': False
             }
             if final_label.lower() in ["fire", "false"]:
                 if (f > 0 and s < 50 and t < 40 and abs(t_delta) < 1.0) or (abs(t_delta) < 0.2 and s < 30):
@@ -177,6 +141,7 @@ def on_message(client, userdata, msg):
         ensure_gateway_exists(conn, gateway_id)
         cur = conn.cursor()
         
+        # Added 'trigger_source' column and one extra %s (total 21 columns)
         sql = """
             INSERT INTO sensor_readings
             (gateway_id, node_id, timestamp, local_timestamp,
@@ -191,7 +156,7 @@ def on_message(client, userdata, msg):
             gateway_id, node, ts_final, ts_early,
             t, h, f, s,
             lat, lon, rssi, snr,
-            final_label, confidence, trigger_source,
+            final_label, confidence, trigger_source, # <--- Added here
             t_delta, s_delta, f_delta, h_delta,
             t_roll, s_roll
         ))
@@ -207,7 +172,7 @@ def on_message(client, userdata, msg):
                 "node_id":       node,
                 "ai_prediction": final_label,
                 "confidence":    f"{confidence*100:.2f}%",
-                "trigger_source": trigger_source,
+                "trigger_source": trigger_source, # <--- New field for Dashboard
                 "temperature":   t,
                 "humidity":      h,
                 "smoke":         s,
