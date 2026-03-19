@@ -1642,6 +1642,14 @@ async def resolve_incident(
         SET status = 'resolved', resolved_at = %s, notes = %s
         WHERE id = %s
     """, (now_str, body.notes, incident_id))
+
+    # 🔑 I-flag ang node bilang dashboard-resolved.
+    # Ibe-block nito ang manual_fire signal sa ai_inference.py
+    # hanggang hindi pa nire-release/cancel ang button sa hardware.
+    cur.execute("""
+        UPDATE nodes SET dashboard_resolved = 1 WHERE node_id = %s
+    """, (node_id,))
+
     conn.commit()
     _shared_traffic.pop(f'incident_{incident_id}', None)
     cur.close(); conn.close()
