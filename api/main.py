@@ -1652,6 +1652,7 @@ async def resolve_incident(
         "incident_id": incident_id,
         "action":      "resolved",
         "node_id":     node_id,
+        "resolved_at": now_str,
     })
     await manager.broadcast({"type": "node_update", "node_id": node_id})
 
