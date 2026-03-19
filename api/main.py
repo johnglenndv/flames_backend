@@ -1639,9 +1639,10 @@ async def resolve_incident(
 
     cur.execute("""
         UPDATE fire_incidents
-        SET status = 'resolved', resolved_at = %s, notes = %s
+        SET status = 'resolved', resolved_at = %s, notes = %s, dashboard_resolved = 1
         WHERE id = %s
     """, (now_str, body.notes, incident_id))
+
     conn.commit()
     _shared_traffic.pop(f'incident_{incident_id}', None)
     cur.close(); conn.close()
